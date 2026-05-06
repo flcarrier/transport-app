@@ -2,12 +2,8 @@ from flask import Flask, request, redirect, render_template_string, jsonify, sen
 import os
 import sqlite3
 
-try:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
-except Exception:
-    psycopg2 = None
-    RealDictCursor = None
+# PostgreSQL driver is imported lazily inside db().
+# This avoids Render startup issues where a top-level import can fail silently.
 import textwrap
 from contextlib import closing
 from datetime import datetime, timedelta
@@ -161,10 +157,26 @@ BASE_HTML = """
 
 
 def db():
-    if USE_POSTGRES:
-        if psycopg2 is None:
-            raise RuntimeError("PostgreSQL mode requires: pip install psycopg2-binary")
-        return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    """Return a database connection.
+
+    Local computer: uses SQLite when DATABASE_URL is not set.
+    Render/online: uses PostgreSQL when DATABASE_URL is set.
+    Supports psycopg v3 first, then psycopg2 as a fallback.
+    """
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+
+    if database_url:
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+            return psycopg.connect(database_url, row_factory=dict_row)
+        except ImportError:
+            try:
+                import psycopg2
+                from psycopg2.extras import RealDictCursor
+                return psycopg2.connect(database_url, cursor_factory=RealDictCursor)
+            except ImportError as exc:
+                raise RuntimeError("PostgreSQL mode requires psycopg. Install with: pip install 'psycopg[binary]'") from exc
 
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
