@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: transport-mvp
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: DATABASE_URL
+        sync: false
