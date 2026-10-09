@@ -2,6 +2,7 @@ Flask
 gunicorn
 psycopg2-binary
 pgeocode
+requests
 reportlab
 pypdf
 Pillow

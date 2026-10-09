@@ -27,13 +27,17 @@ from pypdf import PdfReader, PdfWriter
 from PIL import Image
 
 app = Flask(__name__)
-DB = "transport_mvp.db"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.abspath(os.environ.get("DATA_DIR") or BASE_DIR)
+DB = os.path.join(DATA_DIR, "transport_mvp.db")
 # To use a shared PostgreSQL database, set DATABASE_URL in your environment.
 # If DATABASE_URL is not set, the app keeps using the local SQLite file above.
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 USE_POSTGRES = bool(DATABASE_URL)
-UPLOAD_FOLDER = "uploads"
-SAVED_INVOICE_FOLDER = "saved_invoice_batches"
+if os.environ.get("RENDER") == "true" and not USE_POSTGRES:
+    raise RuntimeError("Set DATABASE_URL in the Render web service's Environment settings before deploying.")
+UPLOAD_FOLDER = os.path.join(DATA_DIR, "uploads")
+SAVED_INVOICE_FOLDER = os.path.join(DATA_DIR, "saved_invoice_batches")
 ALLOWED_EXTENSIONS = {
     "pdf", "png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "doc", "docx", "xls", "xlsx", "txt", "csv"
 }
@@ -163,18 +167,16 @@ def db():
     Render/online: uses PostgreSQL when DATABASE_URL is set.
     Supports psycopg v3 first, then psycopg2 as a fallback.
     """
-    database_url = os.environ.get("DATABASE_URL", "").strip()
-
-    if database_url:
+    if USE_POSTGRES:
         try:
             import psycopg
             from psycopg.rows import dict_row
-            return psycopg.connect(database_url, row_factory=dict_row)
+            return psycopg.connect(DATABASE_URL, row_factory=dict_row)
         except ImportError:
             try:
                 import psycopg2
                 from psycopg2.extras import RealDictCursor
-                return psycopg2.connect(database_url, cursor_factory=RealDictCursor)
+                return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
             except ImportError as exc:
                 raise RuntimeError("PostgreSQL mode requires psycopg. Install with: pip install 'psycopg[binary]'") from exc
 
@@ -3108,8 +3110,11 @@ def delete_invoice(invoice_id):
     return redirect("/invoices")
 
 
+init_db()
+app.logger.warning("Database initialized: %s", "PostgreSQL" if USE_POSTGRES else "local SQLite")
+
+
 if __name__ == "__main__":
-    init_db()
 
     # Listen on all network interfaces so other devices on the same Wi-Fi/LAN
     # can open the app using: http://YOUR_COMPUTER_IP:5000
