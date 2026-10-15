@@ -9,6 +9,7 @@ from contextlib import closing
 from datetime import datetime, timedelta
 from io import BytesIO
 import math
+import re
 import base64
 import uuid
 import mimetypes
@@ -2164,9 +2165,10 @@ def invoices():
     <div class='card' style='margin-top:16px;'>
       <h2>Billing Batch</h2>
       <p>One PDF with each invoice followed by its paperwork. Includes active invoices; cleared invoices remain in the archive.</p>
-      <a href='/invoices/billing-batch'>Download All Billing - One PDF</a>
       <form id='billing-batch-form' method='post' action='/invoices/billing-batch'>
-        <button>Download Selected Billing - One PDF</button>
+        <label>Batch file name<input name='batch_name' placeholder='Example: Evans October Billing'></label>
+        <button name='billing_scope' value='all'>Download All Billing - One PDF</button>
+        <button name='billing_scope' value='selected'>Download Selected Billing - One PDF</button>
       </form>
       <p class='muted'>Downloading does not clear invoices. Clear them after you finish billing.</p>
     </div>
@@ -2607,13 +2609,25 @@ def upload_invoice_paperwork(invoice_id):
     return redirect(f"/invoices/{invoice_id}/pdf")
 
 
+def billing_pdf_filename(default_prefix):
+    name = request.values.get('batch_name', '').strip()
+    if name.lower().endswith('.pdf'):
+        name = name[:-4]
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(' .')[:120].rstrip(' .')
+    if re.fullmatch(r'(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?', name):
+        name = 'Billing_' + name
+    if not name:
+        name = f"{default_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    return name + '.pdf'
+
+
 @app.route("/invoices/billing-batch", methods=["GET", "POST"])
 def billing_batch():
     sql = """SELECT i.*, c.name AS customer_name FROM invoices i
              LEFT JOIN customers c ON c.id=i.customer_id
              WHERE COALESCE(i.is_hidden, 0)=0"""
     params = []
-    if request.method == "POST":
+    if request.method == "POST" and request.form.get('billing_scope') != 'all':
         ids = list(dict.fromkeys(request.form.getlist("invoice_ids")))
         if not ids or any(not value.isdigit() for value in ids):
             return "Select at least one invoice for the billing batch.", 400
@@ -2643,7 +2657,7 @@ def billing_batch():
     writer.write(output)
     output.seek(0)
     return send_file(output, as_attachment=True, mimetype="application/pdf",
-                     download_name=f"billing_batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf")
+                     download_name=billing_pdf_filename('billing_batch'))
 
 
 @app.route("/invoice-archive")
@@ -2753,9 +2767,14 @@ def invoice_archive():
       </div>
 
       <div style='margin-top:16px; margin-bottom:10px;'>
-        <a href='{html_attr(batch_url)}' target='_blank' style='display:inline-block; padding:10px 14px; background:#eef3ff; border-radius:8px;'>
-          Download Batch Invoice Packet PDF
-        </a>
+        <form method='get' action='/invoice-archive/batch-pdf'>
+          <input type='hidden' name='search' value='{html_attr(search)}'>
+          <input type='hidden' name='start_inv' value='{html_attr(start_inv)}'>
+          <input type='hidden' name='end_inv' value='{html_attr(end_inv)}'>
+          <input type='hidden' name='show_cleared' value='{html_attr(show_cleared)}'>
+          <label>Batch file name<input name='batch_name' placeholder='Example: Evans October Billing'></label>
+          <button>Download Batch Invoice Packet PDF</button>
+        </form>
       </div>
 
       <form id='archive-save-form' method='post' action='/invoice-archive/save-selected'>
@@ -2861,7 +2880,7 @@ def invoice_archive_batch_pdf():
     writer.write(output_buffer)
     output_buffer.seek(0)
 
-    filename = f"batch_invoice_packet_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    filename = billing_pdf_filename('batch_invoice_packet')
     return send_file(
         output_buffer,
         as_attachment=True,
