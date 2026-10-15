@@ -867,6 +867,21 @@ def pdf_wrap_lines(text, max_chars=38, max_lines=3):
     return wrapped[:max_lines] if wrapped else [""]
 
 
+def uninvoiced_loads_total():
+    result = query_one("""
+        SELECT COUNT(*) AS load_count, COALESCE(SUM(l.rate), 0) AS total
+        FROM loads l
+        WHERE NOT EXISTS (SELECT 1 FROM invoices i WHERE i.load_id = l.id)
+    """)
+    from decimal import Decimal
+    total = Decimal(str(result['total'] or 0))
+    return f"""<div class='card' id='uninvoiced-loads-total' style='margin-bottom:16px;'>
+      <h2>Total amount of loads not yet invoiced</h2>
+      <strong class='uninvoiced-total'>${total:,.2f}</strong> &middot; {result['load_count']} load(s)
+      <p class='muted'>All load statuses included. Each load leaves this total as soon as an invoice is linked to it, including invoices later cleared to the archive.</p>
+    </div>"""
+
+
 def closed_loads_awaiting_invoices(show_loads=False):
     """Include closed loads only until a linked invoice exists, even if archived."""
     pending = query("""
@@ -1455,6 +1470,7 @@ def loads():
     <div class='grid'>
       <div class='card'>
         <h1>Loads</h1>
+        {uninvoiced_loads_total()}
         {closed_loads_awaiting_invoices()}
         <form method='post' id='load-form'>
           <div class='form-grid'>
