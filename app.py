@@ -41,7 +41,7 @@ SAVED_INVOICE_FOLDER = os.path.join(DATA_DIR, "saved_invoice_batches")
 ALLOWED_EXTENSIONS = {
     "pdf", "png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "doc", "docx", "xls", "xlsx", "txt", "csv"
 }
-LOAD_STATUSES = ["Planned", "Dispatched", "In Transit", "Delivered", "Cancelled"]
+LOAD_STATUSES = ["Planned", "Dispatched", "In Transit", "Delivered", "Closed", "Cancelled"]
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(SAVED_INVOICE_FOLDER, exist_ok=True)
@@ -861,6 +861,41 @@ def pdf_wrap_lines(text, max_chars=38, max_lines=3):
     return wrapped[:max_lines] if wrapped else [""]
 
 
+def closed_loads_awaiting_invoices(show_loads=False):
+    """Include closed loads only until a linked invoice exists, even if archived."""
+    pending = query("""
+        SELECT l.id, l.load_no, l.rate, c.name AS customer_name
+        FROM loads l
+        LEFT JOIN customers c ON c.id = l.customer_id
+        WHERE l.status = 'Closed'
+          AND NOT EXISTS (SELECT 1 FROM invoices i WHERE i.load_id = l.id)
+        ORDER BY l.id DESC
+    """)
+    from decimal import Decimal
+    total = sum((Decimal(str(row["rate"] or 0)) for row in pending), Decimal("0"))
+    details = ""
+    if show_loads:
+        rows = "".join(
+            f"""<tr>
+              <td>{html_attr(row['load_no'] or '')}</td>
+              <td>{html_attr(row['customer_name'] or '')}</td>
+              <td>Closed</td><td>${Decimal(str(row['rate'] or 0)):,.2f}</td>
+              <td><form method='post' action='/loads/{row['id']}/create-invoice' class='inline-form'>
+                <button>Create Invoice</button>
+              </form></td>
+            </tr>""" for row in pending
+        ) or "<tr><td colspan='5'>No closed loads awaiting invoices.</td></tr>"
+        details = f"""<div style='overflow-x:auto;'><table>
+          <thead><tr><th>Load #</th><th>Customer</th><th>Status</th><th>Amount</th><th>Invoice</th></tr></thead>
+          <tbody>{rows}</tbody></table></div>"""
+    return f"""<div class='card' style='margin-bottom:16px;' id='closed-uninvoiced'>
+      <h2>Closed loads awaiting invoices</h2>
+      <strong class='pending-total'>${total:,.2f}</strong> &middot; {len(pending)} load(s)
+      <p class='muted'>Total load charges for closed loads not yet invoiced. Each load leaves this total as soon as an invoice is created for it.</p>
+      {details}
+    </div>"""
+
+
 @app.route("/")
 def dashboard():
     load_count = query_one("SELECT COUNT(*) AS count FROM loads")["count"]
@@ -872,6 +907,7 @@ def dashboard():
     invoice_count = query_one("SELECT COUNT(*) AS count FROM invoices")["count"]
 
     return page(f"""
+    {closed_loads_awaiting_invoices()}
     <div class='stats'>
       <div class='card'><h2>{customer_count}</h2><div>Customers</div></div>
       <div class='card'><h2>{driver_count}</h2><div>Drivers</div></div>
@@ -1413,6 +1449,7 @@ def loads():
     <div class='grid'>
       <div class='card'>
         <h1>Loads</h1>
+        {closed_loads_awaiting_invoices()}
         <form method='post' id='load-form'>
           <div class='form-grid'>
             <input name='load_no' placeholder='Load # / Internal Load #' required>
@@ -2056,6 +2093,7 @@ def invoices():
         invoice_cards = "<div class='card' style='margin-top:16px;'>No invoices yet.</div>"
 
     return page(f"""
+    {closed_loads_awaiting_invoices(show_loads=True)}
     <div class='grid'>
       <div class='card'>
         <h1>Invoices</h1>
