@@ -9,6 +9,11 @@ from contextlib import closing
 from datetime import datetime, timedelta
 from io import BytesIO
 import math
+import base64
+import uuid
+import mimetypes
+from PIL import ImageSequence, ImageOps
+from reportlab.lib.utils import ImageReader
 
 try:
     import pgeocode
@@ -1766,6 +1771,12 @@ def upload_load_file(load_id):
     stored_name = f"{load_id}_{timestamp}_{safe_name}"
     save_path = os.path.join(app.config["UPLOAD_FOLDER"], stored_name)
     uploaded_file.save(save_path)
+    with open(save_path, "rb") as saved:
+        execute("""INSERT INTO billing_attachments
+                   (stored_name, original_name, load_id, uploaded_at, data_base64)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (stored_name, uploaded_file.filename, load_id, datetime.now().isoformat(),
+                 base64.b64encode(saved.read()).decode("ascii")))
 
     execute(
         "INSERT INTO load_files (load_id, original_name, stored_name, uploaded_at) VALUES (?, ?, ?, ?)",
@@ -1776,6 +1787,11 @@ def upload_load_file(load_id):
 
 @app.route("/uploads/<path:filename>")
 def uploaded_file(filename):
+    stored = query_one("SELECT original_name, data_base64 FROM billing_attachments WHERE stored_name = ?", (filename,))
+    if stored:
+        return send_file(BytesIO(base64.b64decode(stored["data_base64"])),
+                         download_name=stored["original_name"],
+                         mimetype=mimetypes.guess_type(stored["original_name"])[0] or "application/octet-stream")
     return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
 
 
@@ -2013,12 +2029,23 @@ def invoices():
     invoice_cards = ""
     for inv in invoice_rows:
         route_text = f"{inv['origin_text'] or ''} - {inv['destination_text'] or ''}"
+        paperwork = invoice_packet_attachments(inv)
+        paperwork_links = "".join(
+            f"<li><a href='/uploads/{html_attr(item['stored_name'])}' target='_blank'>{html_attr(item['original_name'])}</a></li>"
+            for item in paperwork
+        ) or "<li>No paperwork attached yet.</li>"
 
         invoice_cards += f"""
         <div class='invoice-wrap' style='margin-top:16px;'>
           <div class='action-links'>
-  <a href='/invoices/{inv["id"]}/print' target='_blank'>Print</a>
-  <a href='/invoices/{inv["id"]}/pdf' target='_blank'>Invoice Packet PDF</a>
+  <label><input style='width:auto;' type='checkbox' form='billing-batch-form' name='invoice_ids' value='{inv["id"]}'> Include in billing batch</label>
+  <details><summary>Attached paperwork ({len(paperwork)})</summary><ul>{paperwork_links}</ul></details>
+  <form method='post' action='/invoices/{inv["id"]}/upload' enctype='multipart/form-data'>
+    <label>Attach invoice paperwork (PDF or image)<input type='file' name='file' accept='.pdf,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff' required></label>
+    <button>Upload Paperwork</button>
+  </form>
+  <a href='/invoices/{inv["id"]}/print' target='_blank'>Open / Print with Paperwork</a>
+  <a href='/invoices/{inv["id"]}/pdf?download=1' target='_blank'>Download Invoice Packet</a>
 
   <form method='post' action='/invoices/{inv["id"]}/clear' style='display:inline;'>
     <button type='submit'>Clear</button>
@@ -2132,6 +2159,15 @@ def invoices():
       </div>
     </div>
 
+    <div class='card' style='margin-top:16px;'>
+      <h2>Billing Batch</h2>
+      <p>One PDF with each invoice followed by its paperwork. Includes active invoices; cleared invoices remain in the archive.</p>
+      <a href='/invoices/billing-batch'>Download All Billing - One PDF</a>
+      <form id='billing-batch-form' method='post' action='/invoices/billing-batch'>
+        <button>Download Selected Billing - One PDF</button>
+      </form>
+      <p class='muted'>Downloading does not clear invoices. Clear them after you finish billing.</p>
+    </div>
     {invoice_cards}
 
     <script>
@@ -2220,112 +2256,23 @@ def invoices():
 
 @app.route("/invoices/<int:invoice_id>/print")
 def print_invoice(invoice_id):
-    inv = query_one("""
-        SELECT i.*, c.name AS customer_name
-        FROM invoices i
-        LEFT JOIN customers c ON c.id = i.customer_id
-        WHERE i.id = ?
-    """, (invoice_id,))
-
-    if not inv:
-        return "Invoice not found", 404
-
-    route_text = f"{inv['origin_text'] or ''} - {inv['destination_text'] or ''}"
-
-    return f"""
-    <!doctype html>
-    <html>
-    <head>
-      <meta charset="utf-8">
-      <title>Invoice {inv['invoice_no'] or ''}</title>
-      <style>
-        body {{ font-family: Arial, sans-serif; margin: 30px; color: #111; }}
-        .invoice-wrap {{ background: white; }}
-        .invoice-head {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; }}
-        .invoice-title {{ font-size: 34px; font-weight: bold; margin: 0 0 10px 0; }}
-        .invoice-meta {{ min-width: 280px; }}
-        .invoice-meta table {{ width: 100%; border-collapse: collapse; }}
-        .invoice-meta td {{ padding: 4px 8px; border: none; }}
-        .billto-box {{ margin-top: 18px; margin-bottom: 18px; }}
-        table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
-        th, td {{ padding: 10px; border: 1px solid #ddd; text-align: left; vertical-align: top; }}
-        .invoice-total {{ margin-top: 12px; display: flex; justify-content: flex-end; }}
-        .invoice-total-box {{ width: 260px; }}
-        .right {{ text-align: right; }}
-        .print-bar {{ margin-bottom: 20px; }}
-        @media print {{
-          .print-bar {{ display: none; }}
-          body {{ margin: 0.4in; }}
-        }}
-      </style>
-    </head>
-    <body>
-      <div class="print-bar">
-        <button onclick="window.print()">Print Invoice</button>
-      </div>
-
-      <div class='invoice-wrap'>
-        <div class='invoice-head'>
-          <div>
-            <div class='invoice-title'>INVOICE</div>
-            <div class='billto-box'>
-              <div><strong>Bill To :</strong></div>
-              <div>{inv['bill_to_name'] or ''}</div>
-              <div style='white-space:pre-line'>{inv['bill_to_address'] or ''}</div>
-            </div>
-          </div>
-          <div class='invoice-meta'>
-            <table>
-              <tr><td><strong>Invoice Date</strong></td><td>{inv['invoice_date'] or ''}</td></tr>
-              <tr><td><strong>Invoice #</strong></td><td>{inv['invoice_no'] or ''}</td></tr>
-              <tr><td><strong>Terms</strong></td><td>{inv['terms'] or ''}</td></tr>
-              <tr><td><strong>Due Date</strong></td><td>{inv['due_date'] or ''}</td></tr>
-            </table>
-          </div>
-        </div>
-
-        <table>
-          <tr>
-            <th>Date</th>
-            <th>Truck #</th>
-            <th>Customer</th>
-            <th>Load #</th>
-            <th>Origin / Destination</th>
-            <th>Quantity</th>
-            <th>Rate</th>
-            <th>Amount</th>
-          </tr>
-          <tr>
-            <td>{inv['line_date'] or ''}</td>
-            <td>{inv['truck_no'] or ''}</td>
-            <td>{inv['customer_name'] or inv['bill_to_name'] or ''}</td>
-            <td>{inv['load_no'] or ''}</td>
-            <td>
-                <strong>Origin:</strong> {inv['origin_text'] or ''}<br>
-                <strong>Destination:</strong> {inv['destination_text'] or ''}
-              </td>
-            <td>{inv['quantity'] or ''}</td>
-            <td>${float(inv['rate'] or 0):,.2f}</td>
-            <td>${float(inv['amount'] or 0):,.2f}</td>
-          </tr>
-        </table>
-
-        <div class='invoice-total'>
-          <div class='invoice-total-box'>
-            <table>
-              <tr>
-                <td><strong>TOTAL :</strong></td>
-                <td class='right'><strong>${float(inv['total'] or 0):,.2f}</strong></td>
-              </tr>
-            </table>
-          </div>
-        </div>
-      </div>
-    </body>
-    </html>
-    """
+    return redirect(f"/invoices/{invoice_id}/pdf")
 
 
+def invoice_packet_attachments(inv):
+    attachments = query("""
+        SELECT DISTINCT f.original_name, f.stored_name, f.uploaded_at
+        FROM load_files f
+        WHERE f.load_id = ? OR f.id IN (
+            SELECT load_file_id FROM invoice_files WHERE invoice_id = ?
+        )
+        ORDER BY f.uploaded_at, f.stored_name
+    """, (inv["load_id"], inv["id"]))
+    attachments += query("""
+        SELECT original_name, stored_name, uploaded_at FROM billing_attachments
+        WHERE invoice_id = ? ORDER BY uploaded_at, stored_name
+    """, (inv["id"],))
+    return attachments
 
 
 def add_invoice_packet_pages(writer, inv, include_no_docs_note=False):
@@ -2418,73 +2365,81 @@ def add_invoice_packet_pages(writer, inv, include_no_docs_note=False):
         writer.add_page(page)
 
     attached_count = 0
-    image_exts = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff")
-
-    if inv["load_id"]:
-        load_files = query(
-            "SELECT * FROM load_files WHERE load_id = ? ORDER BY uploaded_at ASC, id ASC",
-            (inv["load_id"],)
-        )
-
-        for f in load_files:
-            original_name = (f["original_name"] or "").lower()
-            stored_name = f["stored_name"] or ""
-            file_path = os.path.join(app.config["UPLOAD_FOLDER"], stored_name)
-
-            if not os.path.exists(file_path):
-                continue
-
-            if original_name.endswith(".pdf") or stored_name.lower().endswith(".pdf"):
-                try:
-                    with open(file_path, "rb") as extra_pdf:
-                        extra_reader = PdfReader(extra_pdf)
-                        for page in extra_reader.pages:
-                            writer.add_page(page)
-                    attached_count += 1
-                except Exception:
-                    continue
-
-            elif original_name.endswith(image_exts) or stored_name.lower().endswith(image_exts):
-                try:
-                    img = Image.open(file_path).convert("RGB")
-                    img_buffer = BytesIO()
-                    img_width, img_height = img.size
-                    page_width, page_height = letter
-                    image_pdf = canvas.Canvas(img_buffer, pagesize=letter)
-                    margin = 36
-                    max_width = page_width - (margin * 2)
-                    max_height = page_height - (margin * 2)
-                    scale = min(max_width / img_width, max_height / img_height)
-                    draw_width = img_width * scale
-                    draw_height = img_height * scale
-                    x = (page_width - draw_width) / 2
-                    y_img = (page_height - draw_height) / 2
-                    image_pdf.drawImage(file_path, x, y_img, width=draw_width, height=draw_height, preserveAspectRatio=True, mask="auto")
-                    image_pdf.showPage()
-                    image_pdf.save()
-                    img_buffer.seek(0)
-                    img_reader = PdfReader(img_buffer)
-                    for page in img_reader.pages:
-                        writer.add_page(page)
-                    attached_count += 1
-                except Exception:
-                    continue
-
-    if include_no_docs_note and attached_count == 0:
-        note_buffer = BytesIO()
-        note_pdf = canvas.Canvas(note_buffer, pagesize=letter)
-        note_pdf.setFont("Helvetica-Bold", 16)
-        note_pdf.drawString(50, 750, "Invoice Backup Docs")
-        note_pdf.setFont("Helvetica", 11)
-        note_pdf.drawString(50, 720, f"Invoice {inv['invoice_no'] or inv['id']} has no readable attached PDF or image paperwork.")
-        note_pdf.showPage()
-        note_pdf.save()
-        note_buffer.seek(0)
-        note_reader = PdfReader(note_buffer)
-        for page in note_reader.pages:
-            writer.add_page(page)
-
+    attachments = invoice_packet_attachments(inv)
+    for attachment in attachments:
+        name = attachment["original_name"] or attachment["stored_name"]
+        try:
+            data = read_billing_attachment(attachment["stored_name"])
+            if data is None:
+                raise ValueError("File is missing. Please upload this document again.")
+            if name.lower().endswith('.pdf'):
+                reader = PdfReader(BytesIO(data))
+                if reader.is_encrypted and not reader.decrypt(""):
+                    raise ValueError("Password-protected PDF. Upload an unlocked copy.")
+                if not reader.pages:
+                    raise ValueError("PDF has no pages.")
+                # Validate the entire attachment before adding any of its pages.
+                pages = list(reader.pages)
+                for extra_page in pages:
+                    writer.add_page(extra_page)
+            else:
+                image_buffer = BytesIO()
+                image_pdf = canvas.Canvas(image_buffer, pagesize=letter)
+                with Image.open(BytesIO(data)) as image:
+                    for frame in ImageSequence.Iterator(image):
+                        frame = ImageOps.exif_transpose(frame).convert("RGB")
+                        iw, ih = frame.size
+                        scale = min((letter[0] - 72) / iw, (letter[1] - 72) / ih)
+                        dw, dh = iw * scale, ih * scale
+                        image_pdf.drawImage(ImageReader(frame), (letter[0] - dw) / 2,
+                                            (letter[1] - dh) / 2, width=dw, height=dh)
+                        image_pdf.showPage()
+                image_pdf.save()
+                image_buffer.seek(0)
+                for extra_page in PdfReader(image_buffer).pages:
+                    writer.add_page(extra_page)
+            attached_count += 1
+        except Exception as error:
+            app.logger.warning("Invoice %s attachment %s could not be included: %s", inv["id"], name, error)
+            add_packet_notice(writer, inv, name,
+                              "Document could not be included. It may be missing, unreadable, password-protected, or an unsupported format. Upload a readable PDF or image before billing.")
+    if include_no_docs_note and not attachments:
+        add_packet_notice(writer, inv, "No paperwork attached",
+                          "Upload PDF or image paperwork to this invoice or its linked load, then reopen the packet.")
     return attached_count
+
+
+def add_packet_notice(writer, inv, name, message):
+    buffer = BytesIO()
+    notice = canvas.Canvas(buffer, pagesize=letter)
+    notice.setFont("Helvetica-Bold", 16)
+    notice.drawString(50, 740, "Attachment needs attention")
+    notice.setFont("Helvetica", 11)
+    y = 710
+    for line in textwrap.wrap(f"Invoice {inv['invoice_no'] or inv['id']}: {name}", 85):
+        notice.drawString(50, y, line)
+        y -= 16
+    for line in textwrap.wrap(message, 85):
+        notice.drawString(50, y, line)
+        y -= 16
+    notice.save()
+    buffer.seek(0)
+    writer.add_page(PdfReader(buffer).pages[0])
+
+
+def read_billing_attachment(stored_name):
+    stored = query_one("SELECT data_base64 FROM billing_attachments WHERE stored_name = ?", (stored_name,))
+    if stored:
+        return base64.b64decode(stored["data_base64"])
+    # Older uploads may still exist on the application's local disk.
+    if os.path.basename(stored_name) != stored_name:
+        return None
+    file_path = os.path.join(app.config["UPLOAD_FOLDER"], stored_name)
+    if os.path.isfile(file_path):
+        with open(file_path, "rb") as file:
+            return file.read()
+    return None
+
 
 @app.route("/invoices/<int:invoice_id>/pdf")
 def invoice_pdf(invoice_id):
@@ -2498,205 +2453,15 @@ def invoice_pdf(invoice_id):
     if not inv:
         return "Invoice not found", 404
 
-    # Create the invoice page first
-    invoice_buffer = BytesIO()
-    pdf = canvas.Canvas(invoice_buffer, pagesize=letter)
-    width, height = letter
-
-    left = 50
-    y = height - 50
-
-    pdf.setFont("Helvetica-Bold", 24)
-    pdf.drawString(left, y, "INVOICE")
-
-    pdf.setFont("Helvetica", 10)
-    pdf.drawString(380, y, f"Invoice Date  {inv['invoice_date'] or ''}")
-    pdf.drawString(380, y - 18, f"Invoice #  {inv['invoice_no'] or ''}")
-    pdf.drawString(380, y - 36, f"Terms  {inv['terms'] or ''}")
-    pdf.drawString(380, y - 54, f"Due Date  {inv['due_date'] or ''}")
-
-    y -= 95
-    pdf.setFont("Helvetica-Bold", 11)
-    pdf.drawString(left, y, "Bill To :")
-
-    y -= 18
-    pdf.setFont("Helvetica", 10)
-    pdf.drawString(left, y, inv["bill_to_name"] or "")
-
-    y -= 15
-    bill_lines = (inv["bill_to_address"] or "").splitlines()
-    for line in bill_lines:
-        pdf.drawString(left, y, line)
-        y -= 14
-
-    y -= 10
-
-    headers = ["Date", "Truck #", "Customer", "Load #", "Origin / Destination", "Qty", "Rate", "Amount"]
-    x_positions = [50, 100, 150, 235, 290, 455, 495, 545]
-
-    pdf.setFont("Helvetica-Bold", 9)
-    for i, h in enumerate(headers):
-        pdf.drawString(x_positions[i], y, h)
-
-    y -= 8
-    pdf.line(50, y, 590, y)
-    y -= 18
-
-    route_text = f"{inv['origin_text'] or ''} - {inv['destination_text'] or ''}"
-    customer_name = inv["customer_name"] or inv["bill_to_name"] or ""
-
-    pdf.setFont("Helvetica", 9)
-    pdf.drawString(50, y, str(inv["line_date"] or ""))
-    pdf.drawString(100, y, str(inv["truck_no"] or ""))
-    pdf.drawString(150, y, customer_name[:14])
-    pdf.drawString(235, y, str(inv["load_no"] or ""))
-    origin_lines = pdf_wrap_lines(inv["origin_text"] or "", max_chars=34, max_lines=2)
-    destination_lines = pdf_wrap_lines(inv["destination_text"] or "", max_chars=34, max_lines=2)
-
-    route_y = y
-    pdf.setFont("Helvetica-Bold", 8)
-    pdf.drawString(290, route_y, "Origin:")
-    pdf.setFont("Helvetica", 8)
-    for line in origin_lines:
-        pdf.drawString(330, route_y, line)
-        route_y -= 10
-
-    pdf.setFont("Helvetica-Bold", 8)
-    pdf.drawString(290, route_y, "Destination:")
-    pdf.setFont("Helvetica", 8)
-    for line in destination_lines:
-        pdf.drawString(350, route_y, line)
-        route_y -= 10
-
-    pdf.drawRightString(485, y, str(inv["quantity"] or ""))
-    pdf.drawRightString(540, y, f"${float(inv['rate'] or 0):,.2f}")
-    pdf.drawRightString(590, y, f"${float(inv['amount'] or 0):,.2f}")
-
-    y -= 60
-    pdf.line(430, y + 18, 590, y + 18)
-    pdf.setFont("Helvetica-Bold", 10)
-    pdf.drawString(450, y, "TOTAL :")
-    pdf.drawRightString(590, y, f"${float(inv['total'] or 0):,.2f}")
-
-    pdf.showPage()
-    pdf.save()
-    invoice_buffer.seek(0)
-
-    # Merge invoice + attached paperwork from the load board
     writer = PdfWriter()
-
-    invoice_reader = PdfReader(invoice_buffer)
-    for page in invoice_reader.pages:
-        writer.add_page(page)
-
-    attached_count = 0
-    image_exts = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff")
-
-    if inv["load_id"]:
-        load_files = query(
-            "SELECT * FROM load_files WHERE load_id = ? ORDER BY uploaded_at ASC, id ASC",
-            (inv["load_id"],)
-        )
-
-        for f in load_files:
-            original_name = (f["original_name"] or "").lower()
-            stored_name = f["stored_name"] or ""
-            file_path = os.path.join(app.config["UPLOAD_FOLDER"], stored_name)
-
-            if not os.path.exists(file_path):
-                continue
-
-            # Attach PDFs as extra pages
-            if original_name.endswith(".pdf") or stored_name.lower().endswith(".pdf"):
-                try:
-                    with open(file_path, "rb") as extra_pdf:
-                        extra_reader = PdfReader(extra_pdf)
-                        for page in extra_reader.pages:
-                            writer.add_page(page)
-                    attached_count += 1
-                except Exception:
-                    continue
-
-            # Convert uploaded images to PDF pages and attach them
-            elif original_name.endswith(image_exts) or stored_name.lower().endswith(image_exts):
-                try:
-                    img = Image.open(file_path)
-                    img = img.convert("RGB")
-
-                    img_buffer = BytesIO()
-                    img_width, img_height = img.size
-                    page_width, page_height = letter
-
-                    image_pdf = canvas.Canvas(img_buffer, pagesize=letter)
-                    margin = 36
-
-                    max_width = page_width - (margin * 2)
-                    max_height = page_height - (margin * 2)
-
-                    scale = min(max_width / img_width, max_height / img_height)
-                    draw_width = img_width * scale
-                    draw_height = img_height * scale
-
-                    x = (page_width - draw_width) / 2
-                    y_img = (page_height - draw_height) / 2
-
-                    image_pdf.drawImage(
-                        file_path,
-                        x,
-                        y_img,
-                        width=draw_width,
-                        height=draw_height,
-                        preserveAspectRatio=True,
-                        mask="auto"
-                    )
-                    image_pdf.showPage()
-                    image_pdf.save()
-                    img_buffer.seek(0)
-
-                    img_reader = PdfReader(img_buffer)
-                    for page in img_reader.pages:
-                        writer.add_page(page)
-
-                    attached_count += 1
-                except Exception:
-                    continue
-
-    # Add a note page if no backup docs were found
-    if attached_count == 0:
-        note_buffer = BytesIO()
-        note_pdf = canvas.Canvas(note_buffer, pagesize=letter)
-
-        note_pdf.setFont("Helvetica-Bold", 16)
-        note_pdf.drawString(50, 750, "Invoice Backup Docs")
-
-        note_pdf.setFont("Helvetica", 11)
-        if inv["load_id"]:
-            note_pdf.drawString(50, 720, "No readable backup docs were attached from the load board.")
-            note_pdf.drawString(50, 700, f"Load ID: {inv['load_id']}")
-            note_pdf.drawString(50, 680, "Attach PDF or image files to this load, then generate the Invoice Packet PDF again.")
-        else:
-            note_pdf.drawString(50, 720, "This invoice is not linked to a load.")
-            note_pdf.drawString(50, 700, "Create the invoice from a load or select a load on the invoice form.")
-
-        note_pdf.showPage()
-        note_pdf.save()
-        note_buffer.seek(0)
-
-        note_reader = PdfReader(note_buffer)
-        for page in note_reader.pages:
-            writer.add_page(page)
-
+    add_invoice_packet_pages(writer, inv, include_no_docs_note=True)
     output_buffer = BytesIO()
     writer.write(output_buffer)
     output_buffer.seek(0)
+    return send_file(output_buffer, as_attachment=request.args.get("download") == "1",
+                     download_name=f"invoice_{secure_filename(str(inv['invoice_no'] or invoice_id))}_packet.pdf",
+                     mimetype="application/pdf")
 
-    filename = f"invoice_{inv['invoice_no'] or invoice_id}_packet.pdf"
-    return send_file(
-        output_buffer,
-        as_attachment=True,
-        download_name=filename,
-        mimetype="application/pdf"
-    )
 
 @app.route("/driver-loads")
 def driver_report():
@@ -2790,6 +2555,64 @@ def driver_report():
     </div>
     """)
 
+
+@app.route("/invoices/<int:invoice_id>/upload", methods=["POST"])
+def upload_invoice_paperwork(invoice_id):
+    if not query_one("SELECT id FROM invoices WHERE id=?", (invoice_id,)):
+        return "Invoice not found", 404
+    file = request.files.get("file")
+    if not file or not file.filename or not file.filename.lower().endswith((".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")):
+        return "Choose a PDF or image file.", 400
+    data = file.read()
+    if not data:
+        return "The uploaded file is empty.", 400
+    execute("""INSERT INTO billing_attachments
+               (stored_name, original_name, invoice_id, uploaded_at, data_base64)
+               VALUES (?, ?, ?, ?, ?)""",
+            (f"invoice_{invoice_id}_{uuid.uuid4().hex}_{secure_filename(file.filename)}",
+             file.filename, invoice_id, datetime.now().isoformat(), base64.b64encode(data).decode("ascii")))
+    return redirect(f"/invoices/{invoice_id}/pdf")
+
+
+@app.route("/invoices/billing-batch", methods=["GET", "POST"])
+def billing_batch():
+    sql = """SELECT i.*, c.name AS customer_name FROM invoices i
+             LEFT JOIN customers c ON c.id=i.customer_id
+             WHERE COALESCE(i.is_hidden, 0)=0"""
+    params = []
+    if request.method == "POST":
+        ids = list(dict.fromkeys(request.form.getlist("invoice_ids")))
+        if not ids or any(not value.isdigit() for value in ids):
+            return "Select at least one invoice for the billing batch.", 400
+        sql += " AND i.id IN (" + ",".join("?" for _ in ids) + ")"
+        params = ids
+    rows = query(sql + " ORDER BY i.id", tuple(params))
+    if not rows:
+        return "No active invoices to bill.", 400
+    writer = PdfWriter()
+    cover_buffer = BytesIO()
+    cover = canvas.Canvas(cover_buffer, pagesize=letter)
+    cover.setFont("Helvetica-Bold", 22)
+    cover.drawString(50, 740, "Billing Batch")
+    cover.setFont("Helvetica", 12)
+    cover.drawString(50, 710, f"Invoice count: {len(rows)}")
+    from decimal import Decimal
+    total = sum((Decimal(str(row["total"] or 0)) for row in rows), Decimal("0"))
+    cover.drawString(50, 690, f"Total billed: ${total:,.2f}")
+    cover.drawString(50, 665, "Each invoice is followed by its paperwork.")
+    cover.drawString(50, 645, "Review any attachment notices before sending this batch.")
+    cover.save()
+    cover_buffer.seek(0)
+    writer.add_page(PdfReader(cover_buffer).pages[0])
+    for inv in rows:
+        add_invoice_packet_pages(writer, inv, include_no_docs_note=True)
+    output = BytesIO()
+    writer.write(output)
+    output.seek(0)
+    return send_file(output, as_attachment=True, mimetype="application/pdf",
+                     download_name=f"billing_batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf")
+
+
 @app.route("/invoice-archive")
 def invoice_archive():
     search = request.args.get("search", "").strip()
@@ -2862,8 +2685,8 @@ def invoice_archive():
           <td>{r['origin_text'] or ''} - {r['destination_text'] or ''}</td>
           <td>${float(r['total'] or 0):,.2f}</td>
           <td>
-            <a href='/invoices/{r["id"]}/print' target='_blank'>Print</a> |
-            <a href='/invoices/{r["id"]}/pdf' target='_blank'>Invoice Packet PDF</a>
+            <a href='/invoices/{r["id"]}/print' target='_blank'>Open / Print with Paperwork</a> |
+            <a href='/invoices/{r["id"]}/pdf?download=1' target='_blank'>Download Invoice Packet</a>
           </td>
         </tr>
         """
@@ -2997,7 +2820,7 @@ def invoice_archive_batch_pdf():
         writer.add_page(page)
 
     for inv in rows:
-        add_invoice_packet_pages(writer, inv, include_no_docs_note=False)
+        add_invoice_packet_pages(writer, inv, include_no_docs_note=True)
 
     output_buffer = BytesIO()
     writer.write(output_buffer)
@@ -3149,6 +2972,12 @@ def delete_invoice(invoice_id):
 
 
 init_db()
+execute("""CREATE TABLE IF NOT EXISTS invoice_files (
+           invoice_id INTEGER, load_file_id INTEGER)""")
+execute("""CREATE TABLE IF NOT EXISTS billing_attachments (
+           stored_name TEXT PRIMARY KEY, original_name TEXT NOT NULL,
+           invoice_id INTEGER, load_id INTEGER, uploaded_at TEXT NOT NULL,
+           data_base64 TEXT NOT NULL)""")
 app.logger.warning("Database initialized: %s", "PostgreSQL" if USE_POSTGRES else "local SQLite")
 
 
