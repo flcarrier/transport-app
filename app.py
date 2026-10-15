@@ -2040,6 +2040,7 @@ def invoices():
           <div class='action-links'>
   <label><input style='width:auto;' type='checkbox' form='billing-batch-form' name='invoice_ids' value='{inv["id"]}'> Include in billing batch</label>
   <details><summary>Attached paperwork ({len(paperwork)})</summary><ul>{paperwork_links}</ul></details>
+  {invoice_load_link_form(inv, loads_list, '/invoices')}
   <form method='post' action='/invoices/{inv["id"]}/upload' enctype='multipart/form-data'>
     <label>Attach invoice paperwork (PDF or image)<input type='file' name='file' accept='.pdf,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff' required></label>
     <button>Upload Paperwork</button>
@@ -2138,6 +2139,7 @@ def invoices():
             <textarea name='bill_to_name' id='bill_to_name' placeholder='Bill To Name' rows='2'></textarea>
             <textarea name='bill_to_address' id='bill_to_address' placeholder='Bill To Address' rows='3'></textarea>
 
+            <label for='invoice_load_id'>Linked load for paperwork</label>
             <select name='load_id' id='invoice_load_id'>
               {load_opts}
             </select>
@@ -2257,6 +2259,33 @@ def invoices():
 @app.route("/invoices/<int:invoice_id>/print")
 def print_invoice(invoice_id):
     return redirect(f"/invoices/{invoice_id}/pdf")
+
+
+def invoice_load_link_form(inv, choices, return_to):
+    options = "<option value=''>No linked load</option>" + "".join(
+        f"<option value='{load['id']}' {'selected' if load['id'] == inv['load_id'] else ''}>"
+        f"{html_attr(load['load_no'] or 'No load number')} | Broker: {html_attr(load['broker_load_no'] or '')} | ID {load['id']}</option>"
+        for load in choices
+    )
+    return f"""<form method='post' action='/invoices/{inv['id']}/link-load'>
+      <input type='hidden' name='return_to' value='{return_to}'>
+      <label>Linked load for paperwork<select name='load_id'>{options}</select></label>
+      <button>Save Load Link</button>
+    </form>"""
+
+
+@app.route('/invoices/<int:invoice_id>/link-load', methods=['POST'])
+def link_invoice_load(invoice_id):
+    if not query_one('SELECT id FROM invoices WHERE id=?', (invoice_id,)):
+        return 'Invoice not found', 404
+    load_id = request.form.get('load_id', '').strip()
+    if load_id and (not load_id.isdigit() or not query_one('SELECT id FROM loads WHERE id=?', (load_id,))):
+        return 'Select an existing load.', 400
+    execute('UPDATE invoices SET load_id=? WHERE id=?', (int(load_id) if load_id else None, invoice_id))
+    return_to = request.form.get('return_to')
+    if return_to == '/invoice-archive':
+        return redirect('/invoice-archive?show_cleared=1')
+    return redirect('/invoices')
 
 
 def invoice_packet_attachments(inv):
@@ -2404,8 +2433,12 @@ def add_invoice_packet_pages(writer, inv, include_no_docs_note=False):
             add_packet_notice(writer, inv, name,
                               "Document could not be included. It may be missing, unreadable, password-protected, or an unsupported format. Upload a readable PDF or image before billing.")
     if include_no_docs_note and not attachments:
-        add_packet_notice(writer, inv, "No paperwork attached",
-                          "Upload PDF or image paperwork to this invoice or its linked load, then reopen the packet.")
+        if not inv['load_id']:
+            add_packet_notice(writer, inv, "Invoice has no linked load",
+                              "On Invoices or Invoice Archive, choose the load under Linked load for paperwork and click Save Load Link. Files uploaded on Loads appear only when that load is linked to this invoice. You can also upload paperwork directly to the invoice.")
+        else:
+            add_packet_notice(writer, inv, "No paperwork attached to the linked load",
+                              f"This invoice uses load ID {inv['load_id']}. Upload paperwork to that load or correct Linked load for paperwork on the invoice, then reopen the packet.")
     return attached_count
 
 
@@ -2672,11 +2705,12 @@ def invoice_archive():
         </div>
         """
 
+    load_choices = query('SELECT id, load_no, broker_load_no FROM loads ORDER BY id DESC')
     tr = ""
     for r in rows:
         tr += f"""
         <tr>
-          <td><input type='checkbox' name='invoice_ids' value='{r["id"]}'></td>
+          <td><input type='checkbox' form='archive-save-form' name='invoice_ids' value='{r["id"]}'></td>
           <td>{r['invoice_no'] or ''}</td>
           <td>{r['invoice_date'] or ''}</td>
           <td>{r['due_date'] or ''}</td>
@@ -2687,6 +2721,7 @@ def invoice_archive():
           <td>
             <a href='/invoices/{r["id"]}/print' target='_blank'>Open / Print with Paperwork</a> |
             <a href='/invoices/{r["id"]}/pdf?download=1' target='_blank'>Download Invoice Packet</a>
+            {invoice_load_link_form(r, load_choices, '/invoice-archive')}
           </td>
         </tr>
         """
@@ -2723,13 +2758,14 @@ def invoice_archive():
         </a>
       </div>
 
-      <form method='post' action='/invoice-archive/save-selected'>
+      <form id='archive-save-form' method='post' action='/invoice-archive/save-selected'>
         <div class='card' style='margin-top:12px; margin-bottom:12px;'>
           <h3>Save Selected Invoice PDFs to Folder</h3>
           <input name='folder_name' placeholder='Folder name, example: Evans April 2026' required>
           <button>Save Selected</button>
           <p class='muted'>Select invoices below. If the folder already exists, the PDFs will be placed inside that folder.</p>
         </div>
+      </form>
 
         <table>
           <tr>
@@ -2745,7 +2781,6 @@ def invoice_archive():
           </tr>
           {tr}
         </table>
-      </form>
     </div>
     """)
 
