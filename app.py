@@ -9,7 +9,6 @@ from contextlib import closing
 from datetime import datetime, timedelta
 from io import BytesIO
 import math
-import zipfile
 import re
 import base64
 import uuid
@@ -844,8 +843,85 @@ def execute(sql, params=()):
         conn.commit()
 
 
+FOLDER_SAVE_SCRIPT = r'''<script>
+document.querySelectorAll('form[data-billing-folder]').forEach(form => {
+  const status = document.createElement('p');
+  status.setAttribute('role', 'status');
+  form.appendChild(status);
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (form.dataset.saving === 'true') return;
+    if (!window.showDirectoryPicker) {
+      status.textContent = 'To save directly into a folder, open this page in desktop Chrome or Edge.';
+      return;
+    }
+    const data = new FormData(form);
+    if (event.submitter && event.submitter.name) data.set(event.submitter.name, event.submitter.value);
+    if (data.get('billing_scope') !== 'all' && form.method.toLowerCase() === 'post' && !data.getAll('invoice_ids').length) {
+      status.textContent = 'Select at least one invoice first.';
+      return;
+    }
+    form.dataset.saving = 'true';
+    let saved = 0;
+    let total = 0;
+    try {
+      // The picker must run directly from the user's click, before fetching files.
+      const chosen = await window.showDirectoryPicker({mode: 'readwrite'});
+      status.textContent = 'Preparing invoices...';
+      const method = form.method.toUpperCase();
+      let url = form.action;
+      const options = {method};
+      if (method === 'GET') url += '?' + new URLSearchParams(data);
+      else options.body = data;
+      const response = await fetch(url, options);
+      if (!response.ok) throw new Error(await response.text());
+      const batch = await response.json();
+      total = batch.invoices.length;
+      const directory = batch.folder_name ? await chosen.getDirectoryHandle(batch.folder_name, {create: true}) : chosen;
+      for (const invoice of batch.invoices) {
+        status.textContent = `Saving invoice ${saved + 1} of ${total}...`;
+        const pdf = await fetch(invoice.url);
+        if (!pdf.ok || !(pdf.headers.get('content-type') || '').includes('application/pdf')) {
+          throw new Error(`Could not open ${invoice.filename}. Please try again.`);
+        }
+        const blob = await pdf.blob();
+        let name = invoice.filename;
+        let suffix = 1;
+        while (true) {
+          try {
+            await directory.getFileHandle(name);
+            name = invoice.filename.replace(/\.pdf$/i, ` (${suffix++}).pdf`);
+          } catch (error) {
+            if (error.name !== 'NotFoundError') throw error;
+            break;
+          }
+        }
+        const handle = await directory.getFileHandle(name, {create: true});
+        const writer = await handle.createWritable();
+        try {
+          await writer.write(blob);
+          await writer.close();
+        } catch (error) {
+          await writer.abort().catch(() => {});
+          throw error;
+        }
+        saved++;
+      }
+      status.textContent = `Saved ${saved} separate invoice PDF(s) in ${directory.name}. Existing files were kept. Invoices have not been cleared.`;
+    } catch (error) {
+      if (error.name === 'AbortError') status.textContent = saved ? `Saved ${saved} of ${total} invoice PDF(s) before cancellation.` : 'Folder selection cancelled. No files saved.';
+      else status.textContent = `Saved ${saved} of ${total} invoice PDF(s). ${error.message || 'The folder could not be saved.'}`;
+    } finally {
+      form.dataset.saving = 'false';
+    }
+  });
+});
+
+</script>'''
+
+
 def page(body):
-    return render_template_string(BASE_HTML, body=body)
+    return render_template_string(BASE_HTML, body=body + FOLDER_SAVE_SCRIPT)
 
 
 def selected(value, current):
@@ -2181,11 +2257,11 @@ def invoices():
 
     <div class='card' style='margin-top:16px;'>
       <h2>Billing Batch</h2>
-      <p>A ZIP folder with a separate PDF for each invoice and its paperwork. Includes active invoices; cleared invoices remain in the archive.</p>
-      <form id='billing-batch-form' method='post' action='/invoices/billing-batch'>
-        <label>Batch file name<input name='batch_name' placeholder='Example: Evans October Billing'></label>
-        <button name='billing_scope' value='all'>Download All Billing - ZIP Folder</button>
-        <button name='billing_scope' value='selected'>Download Selected Billing - ZIP Folder</button>
+      <p>Choose a folder on your computer and save a separate PDF for each invoice and its paperwork. Includes active invoices; cleared invoices remain in the archive.</p>
+      <form id='billing-batch-form' data-billing-folder method='post' action='/invoices/billing-batch'>
+        <label>Folder name (optional)<input name='batch_name' placeholder='Example: Evans October Billing'></label>
+        <button name='billing_scope' value='all'>Save All Billing to Folder</button>
+        <button name='billing_scope' value='selected'>Save Selected Billing to Folder</button>
       </form>
       <p class='muted'>Downloading does not clear invoices. Clear them after you finish billing.</p>
     </div>
@@ -2638,27 +2714,16 @@ def billing_pdf_filename(default_prefix, extension='pdf'):
     return name + '.' + extension
 
 
-def download_billing_zip(rows):
+def billing_folder_manifest(rows):
     if not rows:
         return 'No invoices found for this billing folder.', 400
-    filename = billing_pdf_filename('billing_batch', extension='zip')
-    folder = filename[:-4]
-    output = BytesIO()
-    used_names = set()
-    with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
-        for inv in rows:
-            writer = PdfWriter()
-            add_invoice_packet_pages(writer, inv, include_no_docs_note=True)
-            packet = BytesIO()
-            writer.write(packet)
-            number = secure_filename(str(inv['invoice_no'] or inv['id'])) or str(inv['id'])
-            pdf_name = f'invoice_{number}.pdf'
-            if pdf_name.lower() in used_names:
-                pdf_name = f'invoice_{number}_id_{inv["id"]}.pdf'
-            used_names.add(pdf_name.lower())
-            archive.writestr(f'{folder}/{pdf_name}', packet.getvalue())
-    output.seek(0)
-    return send_file(output, as_attachment=True, mimetype='application/zip', download_name=filename)
+    folder = billing_pdf_filename('billing_batch')[:-4] if request.values.get('batch_name', '').strip() else ''
+    invoices = []
+    for inv in rows:
+        number = secure_filename(str(inv['invoice_no'] or inv['id'])) or str(inv['id'])
+        invoices.append({'filename': f'invoice_{number}_id_{inv["id"]}.pdf',
+                         'url': f'/invoices/{inv["id"]}/pdf?download=1'})
+    return jsonify(folder_name=folder, invoices=invoices)
 
 
 @app.route("/invoices/billing-batch", methods=["GET", "POST"])
@@ -2676,7 +2741,7 @@ def billing_batch():
     rows = query(sql + " ORDER BY i.id", tuple(params))
     if not rows:
         return "No active invoices to bill.", 400
-    return download_billing_zip(rows)
+    return billing_folder_manifest(rows)
 
 
 @app.route("/invoice-archive")
@@ -2786,22 +2851,22 @@ def invoice_archive():
       </div>
 
       <div style='margin-top:16px; margin-bottom:10px;'>
-        <form method='get' action='/invoice-archive/batch-pdf'>
+        <form data-billing-folder method='get' action='/invoice-archive/batch-pdf'>
           <input type='hidden' name='search' value='{html_attr(search)}'>
           <input type='hidden' name='start_inv' value='{html_attr(start_inv)}'>
           <input type='hidden' name='end_inv' value='{html_attr(end_inv)}'>
           <input type='hidden' name='show_cleared' value='{html_attr(show_cleared)}'>
-          <label>Batch file name<input name='batch_name' placeholder='Example: Evans October Billing'></label>
-          <button>Download Billing ZIP Folder</button>
+          <label>Folder name (optional)<input name='batch_name' placeholder='Example: Evans October Billing'></label>
+          <button>Save Billing to Folder</button>
         </form>
       </div>
 
-      <form id='archive-save-form' method='post' action='/invoice-archive/save-selected'>
+      <form id='archive-save-form' data-billing-folder method='post' action='/invoice-archive/save-selected'>
         <div class='card' style='margin-top:12px; margin-bottom:12px;'>
           <h3>Save Selected Invoice PDFs to Folder</h3>
-          <input name='folder_name' placeholder='Folder name, example: Evans April 2026' required>
+          <input name='batch_name' placeholder='Folder name (optional), example: Evans April 2026'>
           <button>Save Selected</button>
-          <p class='muted'>Select invoices below. If the folder already exists, the PDFs will be placed inside that folder.</p>
+          <p class='muted'>Select invoices below, then choose a folder on your computer. Existing files are kept.</p>
         </div>
       </form>
 
@@ -2866,63 +2931,18 @@ def invoice_archive_batch_pdf():
     sql += " ORDER BY i.id DESC"
     rows = query(sql, tuple(params))
 
-    return download_billing_zip(rows)
+    return billing_folder_manifest(rows)
 
 @app.route("/invoice-archive/save-selected", methods=["POST"])
 def save_selected_invoices_to_folder():
-    invoice_ids = request.form.getlist("invoice_ids")
-    folder_name = request.form.get("folder_name", "").strip()
-
-    if not invoice_ids:
-        return page("""
-        <div class='card'>
-          <h1>No Invoices Selected</h1>
-          <p>Please go back and check at least one invoice.</p>
-          <p><a href='/invoice-archive'>Back to Invoice Archive</a></p>
-        </div>
-        """)
-
-    safe_folder_name = secure_filename(folder_name)
-    if not safe_folder_name:
-        safe_folder_name = "saved_invoices"
-
-    target_folder = os.path.join(SAVED_INVOICE_FOLDER, safe_folder_name)
-    os.makedirs(target_folder, exist_ok=True)
-
-    placeholders = ",".join("?" for _ in invoice_ids)
-    rows = query(f"""
-        SELECT i.*, c.name AS customer_name
-        FROM invoices i
-        LEFT JOIN customers c ON c.id = i.customer_id
-        WHERE i.id IN ({placeholders})
-        ORDER BY CAST(i.invoice_no AS INTEGER), i.id
-    """, tuple(invoice_ids))
-
-    saved_links = ""
-    saved_count = 0
-
-    for inv in rows:
-        writer = PdfWriter()
-        add_invoice_packet_pages(writer, inv, include_no_docs_note=True)
-
-        invoice_no = secure_filename(str(inv["invoice_no"] or inv["id"]))
-        filename = f"invoice_{invoice_no}_packet.pdf"
-        file_path = unique_file_path(target_folder, filename)
-
-        with open(file_path, "wb") as output_file:
-            writer.write(output_file)
-
-        saved_count += 1
-        saved_filename = os.path.basename(file_path)
-        download_path = f"{safe_folder_name}/{saved_filename}"
-        saved_links += f"<li><a href='/saved-invoices/{download_path}' target='_blank'>{saved_filename}</a></li>"
-
-    # Clear saved invoices from the active invoice board, but keep them in the database.
-    for inv_id in invoice_ids:
-        execute("UPDATE invoices SET is_hidden = 1 WHERE id = ?", (inv_id,))
-
-    # Send user back to the archive so the cleared invoices disappear immediately.
-    return redirect(f"/invoice-archive?saved_count={saved_count}&saved_folder={safe_folder_name}")
+    invoice_ids = list(dict.fromkeys(request.form.getlist("invoice_ids")))
+    if not invoice_ids or any(not value.isdigit() for value in invoice_ids):
+        return 'Select at least one invoice first.', 400
+    placeholders = ','.join('?' for _ in invoice_ids)
+    rows = query(f"""SELECT i.*, c.name AS customer_name FROM invoices i
+        LEFT JOIN customers c ON c.id=i.customer_id
+        WHERE i.id IN ({placeholders}) ORDER BY i.id""", tuple(invoice_ids))
+    return billing_folder_manifest(rows)
 
 
 @app.route("/saved-invoices/<path:filename>")
