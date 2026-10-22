@@ -844,10 +844,58 @@ def execute(sql, params=()):
 
 
 FOLDER_SAVE_SCRIPT = r'''<script>
+(() => {
+let rememberedFolder = null;
+let database = null;
+const locationReady = new Promise(resolve => {
+  if (typeof indexedDB === 'undefined') return resolve();
+  const opening = indexedDB.open('billing-save-location', 1);
+  opening.onupgradeneeded = () => opening.result.createObjectStore('settings');
+  opening.onerror = () => resolve();
+  opening.onsuccess = () => {
+    database = opening.result;
+    const reading = database.transaction('settings').objectStore('settings').get('folder');
+    reading.onsuccess = () => {rememberedFolder = reading.result || null; resolve();};
+    reading.onerror = () => resolve();
+  };
+});
+async function rememberLocation(folder) {
+  rememberedFolder = folder;
+  if (!database) return false;
+  return new Promise(resolve => {
+    try {
+      const transaction = database.transaction('settings', 'readwrite');
+      transaction.objectStore('settings').put(folder, 'folder');
+      transaction.oncomplete = () => resolve(true);
+      transaction.onerror = () => resolve(false);
+      transaction.onabort = () => resolve(false);
+    } catch (_) {resolve(false);}
+  });
+}
 document.querySelectorAll('form[data-billing-folder]').forEach(form => {
   const status = document.createElement('p');
   status.setAttribute('role', 'status');
   form.appendChild(status);
+  const changeLocation = document.createElement('button');
+  changeLocation.type = 'button';
+  changeLocation.textContent = 'Change billing save location';
+  form.appendChild(changeLocation);
+  locationReady.then(() => {
+    if (!status.textContent) status.textContent = rememberedFolder ? `Billing folders will be created inside ${rememberedFolder.name}.` : 'On the first save, approve where billing folders will be created. This location will be remembered when your browser allows it.';
+  });
+  changeLocation.addEventListener('click', async () => {
+    if (!window.showDirectoryPicker) {
+      status.textContent = 'To save directly into a folder, open this page in desktop Chrome or Edge.';
+      return;
+    }
+    try {
+      const folder = await window.showDirectoryPicker({id: 'billing-save-location', startIn: 'downloads', mode: 'readwrite'});
+      const persisted = await rememberLocation(folder);
+      status.textContent = `Billing folders will be created inside ${folder.name}.` + (persisted ? '' : ' This browser could not remember the location for future visits.');
+    } catch (error) {
+      status.textContent = error.name === 'AbortError' ? 'Save location unchanged.' : 'Could not change save location.';
+    }
+  });
   form.addEventListener('submit', async event => {
     event.preventDefault();
     if (form.dataset.saving === 'true') return;
@@ -865,8 +913,18 @@ document.querySelectorAll('form[data-billing-folder]').forEach(form => {
     let saved = 0;
     let total = 0;
     try {
-      // The picker must run directly from the user's click, before fetching files.
-      const chosen = await window.showDirectoryPicker({mode: 'readwrite'});
+      await locationReady;
+      let chosen = rememberedFolder;
+      let persisted = true;
+      if (chosen) {
+        const permission = {mode: 'readwrite'};
+        if (await chosen.queryPermission(permission) !== 'granted' && await chosen.requestPermission(permission) !== 'granted') {
+          throw new Error('Approve access to the remembered billing location, or use Change billing save location.');
+        }
+      } else {
+        chosen = await window.showDirectoryPicker({id: 'billing-save-location', startIn: 'downloads', mode: 'readwrite'});
+        persisted = await rememberLocation(chosen);
+      }
       status.textContent = 'Preparing invoices...';
       const method = form.method.toUpperCase();
       let url = form.action;
@@ -877,7 +935,7 @@ document.querySelectorAll('form[data-billing-folder]').forEach(form => {
       if (!response.ok) throw new Error(await response.text());
       const batch = await response.json();
       total = batch.invoices.length;
-      const directory = batch.folder_name ? await chosen.getDirectoryHandle(batch.folder_name, {create: true}) : chosen;
+      const directory = await chosen.getDirectoryHandle(batch.folder_name, {create: true});
       for (const invoice of batch.invoices) {
         status.textContent = `Saving invoice ${saved + 1} of ${total}...`;
         const pdf = await fetch(invoice.url);
@@ -907,7 +965,7 @@ document.querySelectorAll('form[data-billing-folder]').forEach(form => {
         }
         saved++;
       }
-      status.textContent = `Saved ${saved} separate invoice PDF(s) in ${directory.name}. Existing files were kept. Invoices have not been cleared.`;
+      status.textContent = `Created ${directory.name} inside ${chosen.name} and saved ${saved} separate invoice PDF(s). Existing files were kept. Invoices have not been cleared.` + (persisted ? '' : ' This browser could not remember the location for future visits.');
     } catch (error) {
       if (error.name === 'AbortError') status.textContent = saved ? `Saved ${saved} of ${total} invoice PDF(s) before cancellation.` : 'Folder selection cancelled. No files saved.';
       else status.textContent = `Saved ${saved} of ${total} invoice PDF(s). ${error.message || 'The folder could not be saved.'}`;
@@ -916,6 +974,7 @@ document.querySelectorAll('form[data-billing-folder]').forEach(form => {
     }
   });
 });
+})();
 
 </script>'''
 
@@ -2257,9 +2316,9 @@ def invoices():
 
     <div class='card' style='margin-top:16px;'>
       <h2>Billing Batch</h2>
-      <p>Choose a folder on your computer and save a separate PDF for each invoice and its paperwork. Includes active invoices; cleared invoices remain in the archive.</p>
+      <p>Create a folder using your batch name and save a separate PDF for each invoice and its paperwork. Your billing save location is remembered after the first approval. Includes active invoices; cleared invoices remain in the archive.</p>
       <form id='billing-batch-form' data-billing-folder method='post' action='/invoices/billing-batch'>
-        <label>Folder name (optional)<input name='batch_name' placeholder='Example: Evans October Billing'></label>
+        <label>Batch folder name<input name='batch_name' required placeholder='Example: Evans October Billing'></label>
         <button name='billing_scope' value='all'>Save All Billing to Folder</button>
         <button name='billing_scope' value='selected'>Save Selected Billing to Folder</button>
       </form>
@@ -2717,7 +2776,7 @@ def billing_pdf_filename(default_prefix, extension='pdf'):
 def billing_folder_manifest(rows):
     if not rows:
         return 'No invoices found for this billing folder.', 400
-    folder = billing_pdf_filename('billing_batch')[:-4] if request.values.get('batch_name', '').strip() else ''
+    folder = billing_pdf_filename('billing_batch')[:-4]
     invoices = []
     for inv in rows:
         number = secure_filename(str(inv['invoice_no'] or inv['id'])) or str(inv['id'])
@@ -2856,7 +2915,7 @@ def invoice_archive():
           <input type='hidden' name='start_inv' value='{html_attr(start_inv)}'>
           <input type='hidden' name='end_inv' value='{html_attr(end_inv)}'>
           <input type='hidden' name='show_cleared' value='{html_attr(show_cleared)}'>
-          <label>Folder name (optional)<input name='batch_name' placeholder='Example: Evans October Billing'></label>
+          <label>Batch folder name<input name='batch_name' required placeholder='Example: Evans October Billing'></label>
           <button>Save Billing to Folder</button>
         </form>
       </div>
@@ -2864,9 +2923,9 @@ def invoice_archive():
       <form id='archive-save-form' data-billing-folder method='post' action='/invoice-archive/save-selected'>
         <div class='card' style='margin-top:12px; margin-bottom:12px;'>
           <h3>Save Selected Invoice PDFs to Folder</h3>
-          <input name='batch_name' placeholder='Folder name (optional), example: Evans April 2026'>
+          <label>Batch folder name<input name='batch_name' placeholder='Example: Evans April 2026' required></label>
           <button>Save Selected</button>
-          <p class='muted'>Select invoices below, then choose a folder on your computer. Existing files are kept.</p>
+          <p class='muted'>Select invoices below. A folder with your batch name is created in your remembered billing save location. Existing files are kept.</p>
         </div>
       </form>
 
