@@ -1292,7 +1292,7 @@ def trucks():
             file_html = "<ul class='file-list'>" + "".join(
                 f"""
                 <li>
-                  <a href='/uploads/{f['stored_name']}' target='_blank'>{f['original_name']}</a>
+                  <span>{html_attr(f['original_name'])}</span> <a href='/truck-files/{f['id']}/view' target='_blank' rel='noopener'>View</a> <a href='/truck-files/{f['id']}/view?download=1'>Download</a>
                   <form method='post' action='/truck-files/{f['id']}/delete' style='display:inline;' onsubmit="return confirm('Remove this truck file?');">
                     <button type='submit' style='width:auto; padding:4px 8px; background:#ffdddd;'>Remove</button>
                   </form>
@@ -1335,7 +1335,7 @@ def trucks():
             file_html = "<ul class='file-list'>" + "".join(
                 f"""
                 <li>
-                  <a href='/uploads/{f['stored_name']}' target='_blank'>{f['original_name']}</a>
+                  <span>{html_attr(f['original_name'])}</span> <a href='/trailer-files/{f['id']}/view' target='_blank' rel='noopener'>View</a> <a href='/trailer-files/{f['id']}/view?download=1'>Download</a>
                   <form method='post' action='/trailer-files/{f['id']}/delete' style='display:inline;' onsubmit="return confirm('Remove this trailer file?');">
                     <button type='submit' style='width:auto; padding:4px 8px; background:#ffdddd;'>Remove</button>
                   </form>
@@ -2016,12 +2016,35 @@ def upload_truck_file(truck_id):
     stored_name = f"truck_{truck_id}_{timestamp}_{safe_name}"
     save_path = os.path.join(app.config["UPLOAD_FOLDER"], stored_name)
     uploaded_file.save(save_path)
+    with open(save_path, "rb") as saved:
+        execute("""INSERT INTO billing_attachments
+            (stored_name, original_name, uploaded_at, data_base64) VALUES (?, ?, ?, ?)""",
+            (stored_name, uploaded_file.filename, datetime.now().isoformat(),
+             base64.b64encode(saved.read()).decode("ascii")))
+
 
     execute(
         "INSERT INTO truck_files (truck_id, original_name, stored_name, uploaded_at) VALUES (?, ?, ?, ?)",
         (truck_id, uploaded_file.filename, stored_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
     )
     return redirect("/trucks")
+
+
+@app.route("/truck-files/<int:file_id>/view")
+def view_truck_file(file_id):
+    record = query_one("SELECT * FROM truck_files WHERE id = ?", (file_id,))
+    if not record:
+        return "File not found.", 404
+    stored = query_one("SELECT data_base64 FROM billing_attachments WHERE stored_name = ?", (record["stored_name"],))
+    options = dict(download_name=record["original_name"],
+                   as_attachment=request.args.get("download") == "1",
+                   mimetype=mimetypes.guess_type(record["original_name"])[0] or "application/octet-stream")
+    if stored:
+        return send_file(BytesIO(base64.b64decode(stored["data_base64"])), **options)
+    path = os.path.join(app.config["UPLOAD_FOLDER"], record["stored_name"])
+    if not os.path.isfile(path):
+        return page("<h1>File unavailable</h1><p>This older upload is no longer on the server. Please upload it again.</p><a href='/trucks'>Back to Trucks and Trailers</a>"), 404
+    return send_file(path, **options)
 
 
 @app.route("/truck-files/<int:file_id>/delete", methods=["POST"])
@@ -2052,12 +2075,35 @@ def upload_trailer_file(trailer_id):
     stored_name = f"trailer_{trailer_id}_{timestamp}_{safe_name}"
     save_path = os.path.join(app.config["UPLOAD_FOLDER"], stored_name)
     uploaded_file.save(save_path)
+    with open(save_path, "rb") as saved:
+        execute("""INSERT INTO billing_attachments
+            (stored_name, original_name, uploaded_at, data_base64) VALUES (?, ?, ?, ?)""",
+            (stored_name, uploaded_file.filename, datetime.now().isoformat(),
+             base64.b64encode(saved.read()).decode("ascii")))
+
 
     execute(
         "INSERT INTO trailer_files (trailer_id, original_name, stored_name, uploaded_at) VALUES (?, ?, ?, ?)",
         (trailer_id, uploaded_file.filename, stored_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
     )
     return redirect("/trucks")
+
+
+@app.route("/trailer-files/<int:file_id>/view")
+def view_trailer_file(file_id):
+    record = query_one("SELECT * FROM trailer_files WHERE id = ?", (file_id,))
+    if not record:
+        return "File not found.", 404
+    stored = query_one("SELECT data_base64 FROM billing_attachments WHERE stored_name = ?", (record["stored_name"],))
+    options = dict(download_name=record["original_name"],
+                   as_attachment=request.args.get("download") == "1",
+                   mimetype=mimetypes.guess_type(record["original_name"])[0] or "application/octet-stream")
+    if stored:
+        return send_file(BytesIO(base64.b64decode(stored["data_base64"])), **options)
+    path = os.path.join(app.config["UPLOAD_FOLDER"], record["stored_name"])
+    if not os.path.isfile(path):
+        return page("<h1>File unavailable</h1><p>This older upload is no longer on the server. Please upload it again.</p><a href='/trucks'>Back to Trucks and Trailers</a>"), 404
+    return send_file(path, **options)
 
 
 @app.route("/trailer-files/<int:file_id>/delete", methods=["POST"])
