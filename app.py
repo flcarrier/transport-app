@@ -9,6 +9,7 @@ from contextlib import closing
 from datetime import datetime, timedelta
 from io import BytesIO
 import math
+import zipfile
 import re
 import base64
 import uuid
@@ -2180,11 +2181,11 @@ def invoices():
 
     <div class='card' style='margin-top:16px;'>
       <h2>Billing Batch</h2>
-      <p>One PDF with each invoice followed by its paperwork. Includes active invoices; cleared invoices remain in the archive.</p>
+      <p>A ZIP folder with a separate PDF for each invoice and its paperwork. Includes active invoices; cleared invoices remain in the archive.</p>
       <form id='billing-batch-form' method='post' action='/invoices/billing-batch'>
         <label>Batch file name<input name='batch_name' placeholder='Example: Evans October Billing'></label>
-        <button name='billing_scope' value='all'>Download All Billing - One PDF</button>
-        <button name='billing_scope' value='selected'>Download Selected Billing - One PDF</button>
+        <button name='billing_scope' value='all'>Download All Billing - ZIP Folder</button>
+        <button name='billing_scope' value='selected'>Download Selected Billing - ZIP Folder</button>
       </form>
       <p class='muted'>Downloading does not clear invoices. Clear them after you finish billing.</p>
     </div>
@@ -2625,16 +2626,39 @@ def upload_invoice_paperwork(invoice_id):
     return redirect(f"/invoices/{invoice_id}/pdf")
 
 
-def billing_pdf_filename(default_prefix):
+def billing_pdf_filename(default_prefix, extension='pdf'):
     name = request.values.get('batch_name', '').strip()
-    if name.lower().endswith('.pdf'):
+    if name.lower().endswith(('.pdf', '.zip')):
         name = name[:-4]
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(' .')[:120].rstrip(' .')
     if re.fullmatch(r'(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?', name):
         name = 'Billing_' + name
     if not name:
         name = f"{default_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    return name + '.pdf'
+    return name + '.' + extension
+
+
+def download_billing_zip(rows):
+    if not rows:
+        return 'No invoices found for this billing folder.', 400
+    filename = billing_pdf_filename('billing_batch', extension='zip')
+    folder = filename[:-4]
+    output = BytesIO()
+    used_names = set()
+    with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+        for inv in rows:
+            writer = PdfWriter()
+            add_invoice_packet_pages(writer, inv, include_no_docs_note=True)
+            packet = BytesIO()
+            writer.write(packet)
+            number = secure_filename(str(inv['invoice_no'] or inv['id'])) or str(inv['id'])
+            pdf_name = f'invoice_{number}.pdf'
+            if pdf_name.lower() in used_names:
+                pdf_name = f'invoice_{number}_id_{inv["id"]}.pdf'
+            used_names.add(pdf_name.lower())
+            archive.writestr(f'{folder}/{pdf_name}', packet.getvalue())
+    output.seek(0)
+    return send_file(output, as_attachment=True, mimetype='application/zip', download_name=filename)
 
 
 @app.route("/invoices/billing-batch", methods=["GET", "POST"])
@@ -2652,28 +2676,7 @@ def billing_batch():
     rows = query(sql + " ORDER BY i.id", tuple(params))
     if not rows:
         return "No active invoices to bill.", 400
-    writer = PdfWriter()
-    cover_buffer = BytesIO()
-    cover = canvas.Canvas(cover_buffer, pagesize=letter)
-    cover.setFont("Helvetica-Bold", 22)
-    cover.drawString(50, 740, "Billing Batch")
-    cover.setFont("Helvetica", 12)
-    cover.drawString(50, 710, f"Invoice count: {len(rows)}")
-    from decimal import Decimal
-    total = sum((Decimal(str(row["total"] or 0)) for row in rows), Decimal("0"))
-    cover.drawString(50, 690, f"Total billed: ${total:,.2f}")
-    cover.drawString(50, 665, "Each invoice is followed by its paperwork.")
-    cover.drawString(50, 645, "Review any attachment notices before sending this batch.")
-    cover.save()
-    cover_buffer.seek(0)
-    writer.add_page(PdfReader(cover_buffer).pages[0])
-    for inv in rows:
-        add_invoice_packet_pages(writer, inv, include_no_docs_note=True)
-    output = BytesIO()
-    writer.write(output)
-    output.seek(0)
-    return send_file(output, as_attachment=True, mimetype="application/pdf",
-                     download_name=billing_pdf_filename('billing_batch'))
+    return download_billing_zip(rows)
 
 
 @app.route("/invoice-archive")
@@ -2789,7 +2792,7 @@ def invoice_archive():
           <input type='hidden' name='end_inv' value='{html_attr(end_inv)}'>
           <input type='hidden' name='show_cleared' value='{html_attr(show_cleared)}'>
           <label>Batch file name<input name='batch_name' placeholder='Example: Evans October Billing'></label>
-          <button>Download Batch Invoice Packet PDF</button>
+          <button>Download Billing ZIP Folder</button>
         </form>
       </div>
 
@@ -2863,46 +2866,7 @@ def invoice_archive_batch_pdf():
     sql += " ORDER BY i.id DESC"
     rows = query(sql, tuple(params))
 
-    writer = PdfWriter()
-    screen_total = sum(float(r["total"] or 0) for r in rows)
-
-    # Cover page with batch summary
-    cover_buffer = BytesIO()
-    cover = canvas.Canvas(cover_buffer, pagesize=letter)
-    cover.setFont("Helvetica-Bold", 22)
-    cover.drawString(50, 750, "Batch Invoice Packet")
-    cover.setFont("Helvetica", 12)
-    cover.drawString(50, 720, f"Invoice count: {len(rows)}")
-    cover.drawString(50, 700, f"Total of invoices: ${screen_total:,.2f}")
-    y_line = 680
-    if search:
-        cover.drawString(50, y_line, f"Search filter: {search[:80]}")
-        y_line -= 20
-    if start_inv or end_inv:
-        cover.drawString(50, y_line, f"Invoice range: {start_inv or 'Any'} to {end_inv or 'Any'}")
-        y_line -= 20
-    cover.drawString(50, y_line - 10, "Each invoice is followed by its attached load-board paperwork when available.")
-    cover.showPage()
-    cover.save()
-    cover_buffer.seek(0)
-    cover_reader = PdfReader(cover_buffer)
-    for page in cover_reader.pages:
-        writer.add_page(page)
-
-    for inv in rows:
-        add_invoice_packet_pages(writer, inv, include_no_docs_note=True)
-
-    output_buffer = BytesIO()
-    writer.write(output_buffer)
-    output_buffer.seek(0)
-
-    filename = billing_pdf_filename('batch_invoice_packet')
-    return send_file(
-        output_buffer,
-        as_attachment=True,
-        download_name=filename,
-        mimetype="application/pdf"
-    )
+    return download_billing_zip(rows)
 
 @app.route("/invoice-archive/save-selected", methods=["POST"])
 def save_selected_invoices_to_folder():
