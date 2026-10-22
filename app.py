@@ -99,6 +99,11 @@ BASE_HTML = """
     .suggestion-item:last-child { border-bottom: none; }
     .suggestion-item:hover { background: #f6f9ff; }
     .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; }
+    .equipment-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); }
+    .equipment-grid > .card { min-width: 0; }
+    .equipment-list { grid-column: 1 / -1; overflow-x: auto; }
+    .equipment-list table { min-width: 600px; }
+    .equipment-list .file-list { overflow-wrap: anywhere; }
     .file-list { margin: 0; padding-left: 18px; }
     .file-list li { margin-bottom: 6px; }
     .upload-box { min-width: 220px; }
@@ -1371,7 +1376,7 @@ def trucks():
         trailer_tr = "<tr><td colspan='3'>No trailers yet.</td></tr>"
 
     return page(f"""
-    <div class='grid'>
+    <div class='grid equipment-grid'>
       <div class='card'>
         <h1>Trucks</h1>
         <form method='post'>
@@ -1386,14 +1391,14 @@ def trucks():
           <button>Add Trailer</button>
         </form>
       </div>
-      <div class='card'>
+      <div class='card equipment-list'>
         <h2>Truck List</h2>
         <table>
           <tr><th>Truck / Unit</th><th>Files</th><th>Actions</th></tr>
           {truck_tr}
         </table>
       </div>
-      <div class='card'>
+      <div class='card equipment-list'>
         <h2>Trailer List</h2>
         <table>
           <tr><th>Trailer #</th><th>Files</th><th>Actions</th></tr>
