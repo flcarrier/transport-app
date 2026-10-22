@@ -2240,7 +2240,7 @@ def invoices():
         ) or "<li>No paperwork attached yet.</li>"
 
         invoice_cards += f"""
-        <div class='invoice-wrap' style='margin-top:16px;'>
+        <div class='invoice-wrap' id='invoice-{inv["id"]}' style='margin-top:16px;'>
           <div class='action-links'>
   <label><input style='width:auto;' type='checkbox' form='billing-batch-form' name='invoice_ids' value='{inv["id"]}'> Include in billing batch</label>
   <details><summary>Attached paperwork ({len(paperwork)})</summary><ul>{paperwork_links}</ul></details>
@@ -2809,7 +2809,7 @@ def upload_invoice_paperwork(invoice_id):
                VALUES (?, ?, ?, ?, ?)""",
             (f"invoice_{invoice_id}_{uuid.uuid4().hex}_{secure_filename(file.filename)}",
              file.filename, invoice_id, datetime.now().isoformat(), base64.b64encode(data).decode("ascii")))
-    return redirect(f"/invoices/{invoice_id}/pdf")
+    return redirect(f"/invoices#invoice-{invoice_id}")
 
 
 def billing_pdf_filename(default_prefix, extension='pdf'):
