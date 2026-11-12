@@ -1012,7 +1012,7 @@ def uninvoiced_loads_total():
     result = query_one("""
         SELECT COUNT(*) AS load_count, COALESCE(SUM(l.rate), 0) AS total
         FROM loads l
-        WHERE NOT EXISTS (SELECT 1 FROM invoices i WHERE i.load_id = l.id)
+        WHERE COALESCE(l.is_deleted, 0) = 0 AND NOT EXISTS (SELECT 1 FROM invoices i WHERE i.load_id = l.id)
     """)
     from decimal import Decimal
     total = Decimal(str(result['total'] or 0))
@@ -1029,7 +1029,7 @@ def closed_loads_awaiting_invoices(show_loads=False):
         SELECT l.id, l.load_no, l.rate, c.name AS customer_name
         FROM loads l
         LEFT JOIN customers c ON c.id = l.customer_id
-        WHERE l.status = 'Closed'
+        WHERE COALESCE(l.is_deleted, 0) = 0 AND l.status = 'Closed'
           AND NOT EXISTS (SELECT 1 FROM invoices i WHERE i.load_id = l.id)
         ORDER BY l.id DESC
     """)
@@ -1060,11 +1060,11 @@ def closed_loads_awaiting_invoices(show_loads=False):
 
 @app.route("/")
 def dashboard():
-    load_count = query_one("SELECT COUNT(*) AS count FROM loads")["count"]
-    driver_count = query_one("SELECT COUNT(*) AS count FROM drivers")["count"]
+    load_count = query_one("SELECT COUNT(*) AS count FROM loads WHERE COALESCE(is_deleted, 0) = 0")["count"]
+    driver_count = query_one("SELECT COUNT(*) AS count FROM drivers WHERE COALESCE(is_deleted, 0) = 0")["count"]
     truck_count = query_one("SELECT COUNT(*) AS count FROM trucks")["count"]
     customer_count = query_one("SELECT COUNT(*) AS count FROM customers")["count"]
-    delivered_count = query_one("SELECT COUNT(*) AS count FROM loads WHERE status='Delivered'")["count"]
+    delivered_count = query_one("SELECT COUNT(*) AS count FROM loads WHERE status='Delivered' AND COALESCE(is_deleted, 0) = 0")["count"]
     file_count = query_one("SELECT COUNT(*) AS count FROM load_files")["count"]
     invoice_count = query_one("SELECT COUNT(*) AS count FROM invoices")["count"]
 
@@ -1187,6 +1187,52 @@ def search_customers():
     ])
 
 
+def deleted_records_panel(kind):
+    field = "load_no" if kind == "loads" else "name"
+    label = "load" if kind == "loads" else "driver"
+    records = query(f"SELECT id, {field} AS label FROM {kind} WHERE is_deleted = 1 ORDER BY id DESC")
+    if not records:
+        return ""
+    items = "".join(
+        f"<li>{html_attr(row['label'] or row['id'])} "
+        f"<form method='post' action='/{kind}/{row['id']}/restore' style='display:inline;'>"
+        "<button type='submit' style='width:auto;'>Undo Delete</button></form></li>"
+        for row in records)
+    return f"<details class='card'><summary>Deleted {kind} ({len(records)})</summary><ul>{items}</ul></details>"
+
+
+@app.route("/loads/<int:load_id>/delete", methods=["POST"])
+def delete_load(load_id):
+    if not query_one("SELECT id FROM loads WHERE id=?", (load_id,)):
+        return "Load not found", 404
+    execute("UPDATE loads SET is_deleted=1 WHERE id=?", (load_id,))
+    return redirect("/loads")
+
+
+@app.route("/loads/<int:load_id>/restore", methods=["POST"])
+def restore_load(load_id):
+    if not query_one("SELECT id FROM loads WHERE id=?", (load_id,)):
+        return "Load not found", 404
+    execute("UPDATE loads SET is_deleted=0 WHERE id=?", (load_id,))
+    return redirect("/loads")
+
+
+@app.route("/drivers/<int:driver_id>/delete", methods=["POST"])
+def delete_driver(driver_id):
+    if not query_one("SELECT id FROM drivers WHERE id=?", (driver_id,)):
+        return "Driver not found", 404
+    execute("UPDATE drivers SET is_deleted=1 WHERE id=?", (driver_id,))
+    return redirect("/drivers")
+
+
+@app.route("/drivers/<int:driver_id>/restore", methods=["POST"])
+def restore_driver(driver_id):
+    if not query_one("SELECT id FROM drivers WHERE id=?", (driver_id,)):
+        return "Driver not found", 404
+    execute("UPDATE drivers SET is_deleted=0 WHERE id=?", (driver_id,))
+    return redirect("/drivers")
+
+
 @app.route("/drivers", methods=["GET", "POST"])
 def drivers():
     if request.method == "POST":
@@ -1195,7 +1241,7 @@ def drivers():
             execute("INSERT INTO drivers (name) VALUES (?)", (name,))
         return redirect("/drivers")
 
-    rows = query("SELECT * FROM drivers ORDER BY name")
+    rows = query("SELECT * FROM drivers WHERE COALESCE(is_deleted, 0) = 0 ORDER BY name")
 
     files_by_driver = {}
     driver_file_rows = query("SELECT * FROM driver_files ORDER BY uploaded_at DESC, id DESC")
@@ -1234,13 +1280,19 @@ def drivers():
             </form>
             {file_html}
           </td>
+          <td>
+            <form method='post' action='/drivers/{r['id']}/delete' onsubmit="return confirm('Delete this driver from the driver list? Existing load history will be kept.');">
+              <button type='submit' style='background:#ffdddd;'>Delete Driver</button>
+            </form>
+          </td>
         </tr>
         """
 
     if not tr:
-        tr = "<tr><td colspan='2'>No drivers yet.</td></tr>"
+        tr = "<tr><td colspan='3'>No drivers yet.</td></tr>"
 
     return page(f"""
+    {deleted_records_panel('drivers')}
     <div class='grid'>
       <div class='card'>
         <h1>Drivers</h1>
@@ -1252,7 +1304,7 @@ def drivers():
       <div class='card'>
         <h2>Driver List</h2>
         <table>
-          <tr><th>Name</th><th>Files</th></tr>
+          <tr><th>Name</th><th>Files</th><th>Actions</th></tr>
           {tr}
         </table>
       </div>
@@ -1493,7 +1545,7 @@ def loads():
         )
         return redirect("/loads")
 
-    drivers = query("SELECT * FROM drivers ORDER BY name")
+    drivers = query("SELECT * FROM drivers WHERE COALESCE(is_deleted, 0) = 0 ORDER BY name")
     trucks = query("SELECT * FROM trucks ORDER BY unit_no")
     trailers = query("SELECT * FROM trailers ORDER BY trailer_no")
     loads_list = query(
@@ -1505,6 +1557,7 @@ def loads():
         LEFT JOIN trucks t ON t.id = l.truck_id
         LEFT JOIN trailers tr ON tr.id = l.trailer_id
         LEFT JOIN customers c ON c.id = l.customer_id
+        WHERE COALESCE(l.is_deleted, 0) = 0
         ORDER BY l.id DESC
         """
     )
@@ -1588,6 +1641,9 @@ def loads():
           </td>
           <td>
             <a href='/loads/{l["id"]}/edit'>Edit</a>
+            <form method='post' action='/loads/{l["id"]}/delete' onsubmit="return confirm('Delete this load from the load board? Existing invoices and paperwork will be kept.');">
+              <button type='submit' style='background:#ffdddd;'>Delete Load</button>
+            </form>
           </td>
           <td>
             {invoice_cell}
@@ -1608,6 +1664,7 @@ def loads():
         tr = "<tr><td colspan='28'>No loads yet.</td></tr>"
 
     return page(f"""
+    {deleted_records_panel('loads')}
     <div class='grid'>
       <div class='card'>
         <h1>Loads</h1>
@@ -1803,7 +1860,7 @@ def loads():
 
 @app.route("/loads/<int:load_id>/edit", methods=["GET", "POST"])
 def edit_load(load_id):
-    load = query_one("SELECT * FROM loads WHERE id = ?", (load_id,))
+    load = query_one("SELECT * FROM loads WHERE id = ? AND COALESCE(is_deleted, 0) = 0", (load_id,))
     if not load:
         return "Load not found", 404
 
@@ -1850,7 +1907,7 @@ def edit_load(load_id):
         return redirect("/loads")
 
     customers = query("SELECT * FROM customers ORDER BY name")
-    drivers = query("SELECT * FROM drivers ORDER BY name")
+    drivers = query("SELECT * FROM drivers WHERE COALESCE(is_deleted, 0) = 0 OR id = ? ORDER BY name", (load["driver_id"],))
     trucks = query("SELECT * FROM trucks ORDER BY unit_no")
     trailers = query("SELECT * FROM trailers ORDER BY trailer_no")
 
@@ -2189,6 +2246,7 @@ def invoices():
         LEFT JOIN customers c ON c.id = l.customer_id
         LEFT JOIN trucks t ON t.id = l.truck_id
         LEFT JOIN trailers tr ON tr.id = l.trailer_id
+        WHERE COALESCE(l.is_deleted, 0) = 0
         ORDER BY l.id DESC
     """)
     invoice_rows = query("""
@@ -2484,7 +2542,7 @@ def link_invoice_load(invoice_id):
     if not query_one('SELECT id FROM invoices WHERE id=?', (invoice_id,)):
         return 'Invoice not found', 404
     load_id = request.form.get('load_id', '').strip()
-    if load_id and (not load_id.isdigit() or not query_one('SELECT id FROM loads WHERE id=?', (load_id,))):
+    if load_id and (not load_id.isdigit() or not query_one('SELECT id FROM loads WHERE id=? AND COALESCE(is_deleted, 0) = 0', (load_id,))):
         return 'Select an existing load.', 400
     execute('UPDATE invoices SET load_id=? WHERE id=?', (int(load_id) if load_id else None, invoice_id))
     return_to = request.form.get('return_to')
@@ -2719,7 +2777,7 @@ def driver_report():
         FROM loads l
         LEFT JOIN drivers d ON d.id = l.driver_id
         LEFT JOIN customers c ON c.id = l.customer_id
-        WHERE l.driver_id = ?
+        WHERE l.driver_id = ? AND COALESCE(l.is_deleted, 0) = 0
         """
         params = [driver_id]
 
@@ -2913,7 +2971,7 @@ def invoice_archive():
         </div>
         """
 
-    load_choices = query('SELECT id, load_no, broker_load_no FROM loads ORDER BY id DESC')
+    load_choices = query('SELECT id, load_no, broker_load_no FROM loads WHERE COALESCE(is_deleted, 0) = 0 ORDER BY id DESC')
     tr = ""
     for r in rows:
         tr += f"""
@@ -3068,7 +3126,7 @@ def create_invoice_from_load(load_id):
         LEFT JOIN customers c ON c.id = l.customer_id
         LEFT JOIN trucks t ON t.id = l.truck_id
         LEFT JOIN trailers tr ON tr.id = l.trailer_id
-        WHERE l.id = ?
+        WHERE l.id = ? AND COALESCE(l.is_deleted, 0) = 0
     """, (load_id,))
 
     if not load:
@@ -3136,6 +3194,11 @@ def delete_invoice(invoice_id):
 
 
 init_db()
+for table in ("loads", "drivers"):
+    if USE_POSTGRES:
+        execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS is_deleted INTEGER DEFAULT 0")
+    elif "is_deleted" not in {row["name"] for row in query(f"PRAGMA table_info({table})")}:
+        execute(f"ALTER TABLE {table} ADD COLUMN is_deleted INTEGER DEFAULT 0")
 execute("""CREATE TABLE IF NOT EXISTS invoice_files (
            invoice_id INTEGER, load_file_id INTEGER)""")
 execute("""CREATE TABLE IF NOT EXISTS billing_attachments (
