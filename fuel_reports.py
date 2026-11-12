@@ -123,9 +123,8 @@ def register_fuel(app, db, query, query_one, execute, normalize_sql, page, esc, 
         return page(f"<div class='card'><h1>Fuel report</h1><p>{esc(message)}</p>"
                     "<a href='/fuel'>Back to Fuel Reports</a></div>"), code
 
-    def driver_fields(driver_id):
-        driver = query_one('SELECT fuel_card FROM drivers WHERE id=?', (driver_id,))
-        value = driver['fuel_card'] or ''
+    def driver_fields(driver_id, value):
+        value = value or ''
         return f"""<form method='post' action='/drivers/{driver_id}/fuel-card'>
           <label>Fuel card — last 5 digits shown in WEX
           <input name='fuel_card' inputmode='numeric' pattern='[0-9]{{5}}' maxlength='5'
@@ -273,17 +272,30 @@ def register_fuel(app, db, query, query_one, execute, normalize_sql, page, esc, 
                         raise ValueError('This export is from a different WEX account. Import the same account so masked card numbers are not mixed.')
                     if not source:
                         run(conn, 'INSERT INTO fuel_import_source(id,account_key) VALUES (1,?)', (rows[0]['account_key'],))
+                    existing_by_id = {}
+                    for offset in range(0, len(rows), 500):
+                        chunk = rows[offset:offset + 500]
+                        placeholders = ','.join('?' for _ in chunk)
+                        existing_by_id.update((r['id'], r) for r in run(conn,
+                            f'SELECT * FROM fuel_transactions WHERE id IN ({placeholders})',
+                            tuple(r['id'] for r in chunk)).fetchall())
+                    pending = []
                     for row in rows:
-                        existing = run(conn, 'SELECT * FROM fuel_transactions WHERE id=?', (row['id'],)).fetchone()
+                        existing = existing_by_id.get(row['id'])
                         if existing:
                             if any(str(existing[k]) != str(v) for k, v in row.items()):
                                 raise ValueError(f"Transaction {row['transaction_no']} conflicts with an existing import. No rows from this file were imported.")
                             skipped += 1
                             continue
-                        columns = list(row) + ['imported_at']
-                        run(conn, f"INSERT INTO fuel_transactions ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
-                            tuple(row.values()) + (datetime.now().isoformat(),))
-                        inserted += 1
+                        pending.append(row)
+                    columns = list(rows[0]) + ['imported_at']
+                    imported_at = datetime.now().isoformat()
+                    for offset in range(0, len(pending), 100):
+                        chunk = pending[offset:offset + 100]
+                        placeholders = ','.join('(' + ','.join('?' for _ in columns) + ')' for _ in chunk)
+                        values = tuple(value for row in chunk for value in (*row.values(), imported_at))
+                        run(conn, f"INSERT INTO fuel_transactions ({','.join(columns)}) VALUES {placeholders}", values)
+                    inserted = len(pending)
                     conn.commit()
                 except Exception:
                     conn.rollback()
@@ -330,8 +342,11 @@ def register_fuel(app, db, query, query_one, execute, normalize_sql, page, esc, 
                     run(conn, '''INSERT INTO driver_fuel_reports
                         (id,driver_id,driver_name,card,start_date,end_date,kind,saved_at) VALUES (?,?,?,?,?,?,?,?)''',
                         (report_id, driver_id, driver['name'] or '', driver['fuel_card'], start, end, kind, datetime.now().isoformat()))
-                    for transaction_id in ids:
-                        run(conn, 'INSERT INTO driver_fuel_report_items(report_id,transaction_id) VALUES (?,?)', (report_id, transaction_id))
+                    for offset in range(0, len(ids), 100):
+                        chunk = ids[offset:offset + 100]
+                        values = tuple(value for transaction_id in chunk for value in (report_id, transaction_id))
+                        run(conn, 'INSERT INTO driver_fuel_report_items(report_id,transaction_id) VALUES ' +
+                            ','.join('(?,?)' for _ in chunk), values)
                     conn.commit()
                 except Exception:
                     conn.rollback()

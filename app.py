@@ -1281,7 +1281,7 @@ def drivers():
               <input name='name' value='{html_attr(r['name'])}' required>
               <button type='submit'>Save Edit</button>
             </form>
-            {fuel_driver_fields(r['id'])}
+            {fuel_driver_fields(r['id'], r['fuel_card'])}
           </td>
           <td>
             <form method='post' action='/drivers/{r['id']}/upload' enctype='multipart/form-data'>
