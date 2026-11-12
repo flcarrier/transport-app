@@ -163,6 +163,7 @@ BASE_HTML = """
     <a href="/invoices">Invoices</a>
     <a href="/invoice-archive">Invoice Archive</a>
     <a href="/driver-loads">Driver Load Report</a>
+    <a href="/fuel">Fuel Reports</a>
   </div>
   <hr>
   {{ body|safe }}
@@ -1238,7 +1239,15 @@ def drivers():
     if request.method == "POST":
         name = request.form.get("name", "").strip()
         if name:
-            execute("INSERT INTO drivers (name) VALUES (?)", (name,))
+            raw_card = request.form.get("fuel_card", "").strip()
+            try:
+                from fuel_reports import card_suffix
+                card = card_suffix(raw_card) if raw_card else None
+            except ValueError as exc:
+                return page(f"<p>{html_attr(str(exc))}</p><a href='/drivers'>Back to Drivers</a>"), 400
+            if card and query_one("SELECT id FROM drivers WHERE fuel_card=?", (card,)):
+                return page("<p>That fuel card is already assigned to another driver.</p><a href='/drivers'>Back to Drivers</a>"), 400
+            execute("INSERT INTO drivers (name, fuel_card) VALUES (?, ?)", (name, card))
         return redirect("/drivers")
 
     rows = query("SELECT * FROM drivers WHERE COALESCE(is_deleted, 0) = 0 ORDER BY name")
@@ -1272,6 +1281,7 @@ def drivers():
               <input name='name' value='{html_attr(r['name'])}' required>
               <button type='submit'>Save Edit</button>
             </form>
+            {fuel_driver_fields(r['id'])}
           </td>
           <td>
             <form method='post' action='/drivers/{r['id']}/upload' enctype='multipart/form-data'>
@@ -1293,15 +1303,16 @@ def drivers():
 
     return page(f"""
     {deleted_records_panel('drivers')}
-    <div class='grid'>
+    <div class='grid equipment-grid'>
       <div class='card'>
         <h1>Drivers</h1>
         <form method='post'>
           <input name='name' placeholder='Driver name' required>
+          <label>Fuel card — last 5 digits shown in WEX<input name='fuel_card' inputmode='numeric' pattern='[0-9]{{5}}' maxlength='5' placeholder='Optional: 01531'></label>
           <button>Add</button>
         </form>
       </div>
-      <div class='card'>
+      <div class='card equipment-list'>
         <h2>Driver List</h2>
         <table>
           <tr><th>Name</th><th>Files</th><th>Actions</th></tr>
@@ -2825,9 +2836,9 @@ def driver_report():
       <form>
         <select name='driver_id' required>{opts}</select>
         <label>Start date</label>
-        <input type='date' name='start' value='{start}'>
+        <input type='date' name='start' value='{html_attr(start)}'>
         <label>End date</label>
-        <input type='date' name='end' value='{end}'>
+        <input type='date' name='end' value='{html_attr(end)}'>
         <button>Run</button>
       </form>
       <table>
@@ -2849,6 +2860,7 @@ def driver_report():
         {rows}
       </table>
     </div>
+    {fuel_report_section(driver_id, start, end)}
     """)
 
 
@@ -3205,6 +3217,9 @@ execute("""CREATE TABLE IF NOT EXISTS billing_attachments (
            stored_name TEXT PRIMARY KEY, original_name TEXT NOT NULL,
            invoice_id INTEGER, load_id INTEGER, uploaded_at TEXT NOT NULL,
            data_base64 TEXT NOT NULL)""")
+from fuel_reports import register_fuel
+fuel_driver_fields, fuel_report_section = register_fuel(
+    app, db, query, query_one, execute, normalize_sql, page, html_attr, USE_POSTGRES)
 app.logger.warning("Database initialized: %s", "PostgreSQL" if USE_POSTGRES else "local SQLite")
 
 
