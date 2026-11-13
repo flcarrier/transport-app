@@ -2806,6 +2806,7 @@ def driver_report():
     )
 
     rows = "<tr><td colspan='13'>Select a driver and run the report.</td></tr>"
+    mileage_rows = "<tr><td colspan='5'>Select a driver and dates, then click Load Trips / Enter Miles.</td></tr>"
     if driver_id:
         sql = """
         SELECT l.*, d.name AS driver_name, c.name AS customer_name
@@ -2817,16 +2818,17 @@ def driver_report():
         params = [driver_id]
 
         if start:
-            sql += " AND COALESCE(l.delivery_date, l.pickup_date) >= ?"
+            sql += " AND COALESCE(NULLIF(l.delivery_date,''), l.pickup_date) >= ?"
             params.append(start)
         if end:
-            sql += " AND COALESCE(l.delivery_date, l.pickup_date) <= ?"
+            sql += " AND COALESCE(NULLIF(l.delivery_date,''), l.pickup_date) <= ?"
             params.append(end)
 
-        sql += " ORDER BY COALESCE(l.delivery_date, l.pickup_date) DESC, l.id DESC"
+        sql += " ORDER BY COALESCE(NULLIF(l.delivery_date,''), l.pickup_date) DESC, l.id DESC"
         data = query(sql, tuple(params))
 
         report_rows = []
+        mileage_items = []
         for r in data:
             total_miles = total_route_miles(
                 r["origin_zip"],
@@ -2834,6 +2836,16 @@ def driver_report():
                 r["optional_stop_2_zip"],
                 r["destination_zip"],
             )
+            loaded_value = r["loaded_miles"]
+            empty_value = r["empty_miles"]
+            estimated_hint = f"Route estimate: {total_miles:,.2f} miles" if total_miles is not None else "Enter paid loaded miles"
+            if loaded_value is not None and empty_value is not None:
+                total_miles = float(loaded_value) + float(empty_value)
+            mileage_items.append(
+                f"<tr><td>{html_attr(r['load_no'])}</td><td>{html_attr(r['delivery_date'] or r['pickup_date'])}</td>"
+                f"<td>{html_attr(r['origin'])} to {html_attr(r['destination'])}<br><small>{estimated_hint}</small></td>"
+                f"<td><input form='driver-report-form' type='number' min='0' step='0.01' style='min-width:90px;' name='loaded_miles_{r['id']}' value='{html_attr(loaded_value)}' aria-label='Loaded miles for load {r['id']}'></td>"
+                f"<td><input form='driver-report-form' type='number' min='0' step='0.01' style='min-width:90px;' name='empty_miles_{r['id']}' value='{html_attr(empty_value)}' aria-label='Empty miles for load {r['id']}'></td></tr>")
             report_rows.append(
                 f"<tr>"
                 f"<td>{r['load_no'] or ''}</td>"
@@ -2852,12 +2864,17 @@ def driver_report():
                 f"</tr>"
             )
 
+        mileage_rows = "".join(mileage_items) or "<tr><td colspan='5'>No loads found for this driver and date range.</td></tr>"
         rows = "".join(report_rows) or "<tr><td colspan='13'>No loads found for that driver and date range.</td></tr>"
 
+    current_driver = next((d for d in drivers if str(d['id']) == str(driver_id)), None)
+    profile_rate = current_driver['pay_rate_per_mile'] if current_driver else None
+    rate_message = f"Driver pay rate: ${float(profile_rate):.4f} per mile (from driver profile)." if profile_rate is not None else "Select a driver with a saved pay rate per mile."
+    saved_message = "Miles saved." if request.args.get('miles_saved') == 'yes' else ""
     return page(f"""
     <div class='card'>
       <h1>Driver Report</h1>
-      <form action='/driver-loads/pdf'>
+      <form id='driver-report-form' method='post' action='/driver-loads/pdf'>
         <select name='driver_id' required>{opts}</select>
         <label>Start date</label>
         <input type='date' name='start' value='{html_attr(start)}' required>
@@ -2865,9 +2882,15 @@ def driver_report():
         <input type='date' name='end' value='{html_attr(end)}' required>
         {statement_report_controls()}
         <button>Run / Download PDF</button>
-        <button formaction='/driver-loads'>Preview Loads / Save Fuel Coverage</button>
+        <button formaction='/driver-loads' formmethod='get'>Load Trips / Enter Miles</button>
+        <button formaction='/driver-loads/miles' formmethod='post'>Save Miles</button>
       </form>
-      <table>
+      <p><strong>{rate_message}</strong></p><p role='status'>{saved_message}</p>
+      <p>Load trips for the selected dates, enter loaded and empty miles below, then Save Miles or Run / Download PDF. Enter 0 when there are no empty miles. Route estimates are shown as a reference; only entered miles are used for payment.</p>
+      <h2>Paid Miles for This Report</h2>
+      <div style='overflow-x:auto;'><table><tr><th>Trip #</th><th>Date</th><th>Route</th><th>Loaded Miles</th><th>Empty Miles</th></tr>{mileage_rows}</table></div>
+      <h2>Trip Details</h2>
+      <div style='overflow-x:auto;'><table>
         <tr>
           <th>Load #</th>
           <th>Customer</th>
@@ -2879,12 +2902,12 @@ def driver_report():
           <th>Stop 2 ZIP</th>
           <th>Destination</th>
           <th>Destination ZIP</th>
-          <th>Total Miles</th>
-          <th>Rate</th>
+          <th>Total Miles / Route Estimate</th>
+          <th>Load Amount</th>
           <th>Status</th>
         </tr>
         {rows}
-      </table>
+      </table></div>
     </div>
     {fuel_report_section(driver_id, start, end)}
     """)

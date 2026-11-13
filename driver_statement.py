@@ -3,6 +3,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from io import BytesIO
 from xml.sax.saxutils import escape
 from datetime import datetime
+from urllib.parse import urlencode
 
 from flask import request, redirect, send_file
 
@@ -110,44 +111,92 @@ def register_statements(app, query, query_one, execute, page, esc, postgres):
           <label>Type<select name='adjustment_type'><option value='credit'>Credit — add to check</option><option value='deduction'>Deduction — subtract from check</option></select></label>
           </details>"""
 
-    @app.route('/driver-loads/pdf')
-    def driver_statement_pdf():
+    def report_context():
         from fuel_reports import iso_date
+        driver_id=int(request.values.get('driver_id',''))
+        start,end=iso_date(request.values.get('start')),iso_date(request.values.get('end'))
+        if start>end:
+            raise ValueError('Start date must not be after end date.')
+        driver=query_one('SELECT * FROM drivers WHERE id=?',(driver_id,))
+        if not driver:
+            raise ValueError('Choose an existing driver.')
+        loads=[dict(r) for r in query('''SELECT l.*, t.unit_no AS truck_unit FROM loads l LEFT JOIN trucks t ON t.id=l.truck_id
+                       WHERE l.driver_id=? AND COALESCE(l.is_deleted,0)=0
+                         AND COALESCE(NULLIF(l.delivery_date,''),l.pickup_date)>=?
+                         AND COALESCE(NULLIF(l.delivery_date,''),l.pickup_date)<=?
+                       ORDER BY COALESCE(NULLIF(l.delivery_date,''),l.pickup_date),l.id''',(driver_id,start,end))]
+        return driver,start,end,loads
+
+    def save_report_miles(driver, loads, persist=True):
+        changes=[]
+        valid_ids={r['id'] for r in loads}
+        for key in request.form:
+            for prefix in ('loaded_miles_','empty_miles_'):
+                if key.startswith(prefix):
+                    try:
+                        load_id=int(key[len(prefix):])
+                    except ValueError:
+                        raise ValueError('Invalid trip in the mileage form. Reload the trip list.')
+                    if load_id not in valid_ids:
+                        raise ValueError('The mileage form includes a trip outside this driver and date range. Reload the trip list.')
+        for row in loads:
+            loaded_key,empty_key=f"loaded_miles_{row['id']}",f"empty_miles_{row['id']}"
+            if loaded_key not in request.form and empty_key not in request.form:
+                continue
+            loaded=mileage_input(request.form.get(loaded_key,row['loaded_miles']))
+            empty=mileage_input(request.form.get(empty_key,row['empty_miles']))
+            changes.append((row['id'],loaded,empty))
+            row['loaded_miles'],row['empty_miles']=loaded,empty
+        if changes and persist:
+            cases=' '.join('WHEN ? THEN ?' for _ in changes)
+            placeholders=','.join('?' for _ in changes)
+            args=tuple(v for row in changes for v in (row[0],row[1]))
+            args+=tuple(v for row in changes for v in (row[0],row[2]))
+            args+=(driver['id'],)+tuple(row[0] for row in changes)
+            execute(f'''UPDATE loads SET loaded_miles=CASE id {cases} ELSE loaded_miles END,
+                        empty_miles=CASE id {cases} ELSE empty_miles END
+                        WHERE driver_id=? AND id IN ({placeholders}) AND COALESCE(is_deleted,0)=0''',args)
+
+    @app.route('/driver-loads/miles',methods=['POST'])
+    def save_driver_report_miles():
         try:
-            driver_id=int(request.args.get('driver_id',''))
-            start,end=iso_date(request.args.get('start')),iso_date(request.args.get('end'))
-            if start>end:
-                raise ValueError('Start date must not be after end date.')
-            driver=query_one('SELECT * FROM drivers WHERE id=?',(driver_id,))
-            if not driver:
-                raise ValueError('Choose an existing driver.')
+            driver,start,end,loads=report_context()
+            save_report_miles(driver,loads)
+        except (ValueError,TypeError) as exc:
+            return error(str(exc))
+        return redirect('/driver-loads?'+urlencode(dict(driver_id=driver['id'],start=start,end=end,miles_saved='yes')))
+
+    @app.route('/driver-loads/pdf',methods=['GET','POST'])
+    def driver_statement_pdf():
+        try:
+            driver,start,end,loads=report_context()
+            driver_id=driver['id']
             rate=amount(driver['pay_rate_per_mile'],optional=True,nonnegative=True)
             if rate is not None and rate != rate.quantize(Decimal('.0001')):
                 raise ValueError('Enter a pay rate with no more than four decimal places.')
-            loads=query('''SELECT l.*, t.unit_no AS truck_unit FROM loads l LEFT JOIN trucks t ON t.id=l.truck_id
-                           WHERE l.driver_id=? AND COALESCE(l.is_deleted,0)=0
-                             AND COALESCE(NULLIF(l.delivery_date,''),l.pickup_date)>=?
-                             AND COALESCE(NULLIF(l.delivery_date,''),l.pickup_date)<=?
-                           ORDER BY COALESCE(NULLIF(l.delivery_date,''),l.pickup_date),l.id''',(driver_id,start,end))
+            if request.method=='POST':
+                save_report_miles(driver,loads,persist=False)
             trips=[dict(load_no=r['load_no'],date=r['delivery_date'] or r['pickup_date'],
                         route=' - '.join(filter(None,[r['origin'],r['optional_stop_1'],r['optional_stop_2'],r['destination']])),
                         loaded_miles=r['loaded_miles'],empty_miles=r['empty_miles']) for r in loads]
             adjustments=[]
-            adjustment=amount(request.args.get('adjustment_amount'),optional=True,nonnegative=True)
+            adjustment=amount(request.values.get('adjustment_amount'),optional=True,nonnegative=True)
             if adjustment is not None:
-                description=request.args.get('adjustment_description','').strip()
-                kind=request.args.get('adjustment_type')
+                description=request.values.get('adjustment_description','').strip()
+                kind=request.values.get('adjustment_type')
                 if not description or kind not in ('credit','deduction') or adjustment!=adjustment.quantize(Decimal('.01')):
                     raise ValueError('Enter a description, type, and amount with up to two decimal places for the adjustment.')
                 adjustments.append(dict(description=description,date=end,amount=adjustment if kind=='credit' else -adjustment))
             info=dict(company_name='Florida Carrier & Brokerage Service Inc',
-                      company_address=request.args.get('company_address','').strip(),remit_to=request.args.get('remit_to','').strip(),
+                      company_address=request.values.get('company_address','').strip(),remit_to=request.values.get('remit_to','').strip(),
                       driver_name=driver['name'],payee_name=driver['payee_name'],address=driver['mailing_address'],
-                      statement_no=request.args.get('statement_no','').strip() or f'DR-{driver_id}-{start.replace("-","")}-{end.replace("-","")}',
+                      statement_no=request.values.get('statement_no','').strip() or f'DR-{driver_id}-{start.replace("-","")}-{end.replace("-","")}',
                       statement_date=datetime.now().strftime('%m/%d/%Y'),start=start,end=end,pay_rate=rate,
                       trucks=', '.join(sorted({r['truck_unit'] for r in loads if r['truck_unit']})),
                       notes='')
             result=render_statement(info,trips,adjustments)
+            if request.method=='POST':
+                save_report_miles(driver,loads)
         except (ValueError,TypeError) as exc:
             return error(str(exc))
         return send_file(BytesIO(result),mimetype='application/pdf',as_attachment=True,
@@ -202,13 +251,23 @@ def render_statement(info, trips, adjustments):
              p(info.get('payee_name') or info['driver_name'], 'header')]
     if info.get('address'):
         story.append(p(info['address']))
-    story += [Spacer(1,8), p(f"Report period: {info['start']} through {info['end']}"), Spacer(1,12)]
+    rate_text=f"${result['rate']:.4f} per mile" if result['rate'] is not None else 'Not set in driver profile'
+    story += [Spacer(1,8), p(f"Report period: {info['start']} through {info['end']}"),
+              p('Driver pay rate: '+rate_text), Spacer(1,12)]
     if not result['complete']:
-        story += [p('INCOMPLETE: Enter the driver pay rate and loaded/empty miles for every trip. The check amount has not been calculated.', 'warning'), Spacer(1,8)]
+        missing=[]
+        if result['rate'] is None:
+            missing.append('driver pay rate in the profile')
+        if any(r['loaded'] is None for r in result['items']):
+            missing.append('loaded miles')
+        if any(r['empty'] is None for r in result['items']):
+            missing.append('empty miles')
+        story += [p('INCOMPLETE: Missing ' + ', '.join(missing) + '. Enter the missing values on the Driver Report tab. The check amount has not been calculated.', 'warning'), Spacer(1,8)]
     story.append(p('Trips:', 'header'))
     data = [[p(h, 'small') for h in ['Date','Trip #','Route','Description','Loaded\nMiles','Empty\nMiles','Total\nMiles','Amount']]]
     for row in result['items']:
-        desc = (f"{miles(row['total_miles'])} total miles @ {result['rate']:.4f}" if row['total_miles'] is not None and result['rate'] is not None else 'Mileage / pay rate not entered')
+        desc = (f"{miles(row['total_miles'])} total miles @ {result['rate']:.4f}" if row['total_miles'] is not None and result['rate'] is not None else
+                f"Mileage not entered; pay rate ${result['rate']:.4f} per mile" if result['rate'] is not None else 'Pay rate not entered in driver profile')
         data.append([p(row.get('date'), 'small'), p(row.get('load_no'), 'small'),
                      p(row.get('route'), 'small'), p(desc, 'small'), p(miles(row['loaded']), 'small'),
                      p(miles(row['empty']), 'small'), p(miles(row['total_miles']), 'small'), p(money(row['pay']), 'small')])
