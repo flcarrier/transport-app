@@ -103,8 +103,7 @@ def register_statements(app, query, query_one, execute, page, esc, postgres):
           <label>Statement number (optional)<input name='statement_no'></label>
           <label>Company address (optional)<textarea name='company_address'></textarea></label>
           <label>Remit-to information (optional)<textarea name='remit_to'></textarea></label>
-          <p>Fuel is shown for reference only and is never deducted from the check amount. The driver's saved rate per mile is used.</p>
-          <p>This PDF is a preview and does not mark fuel as reported.</p>
+          <p>The PDF uses the driver's saved rate per mile and entered loaded/empty miles.</p>
           <h3>Credits and deductions (optional)</h3>
           <label>Description<input name='adjustment_description' placeholder='Example: Expense reimbursement'></label>
           <label>Amount ($)<input type='number' min='0' step='0.01' name='adjustment_amount'></label>
@@ -133,11 +132,6 @@ def register_statements(app, query, query_one, execute, page, esc, postgres):
             trips=[dict(load_no=r['load_no'],date=r['delivery_date'] or r['pickup_date'],
                         route=' - '.join(filter(None,[r['origin'],r['optional_stop_1'],r['optional_stop_2'],r['destination']])),
                         loaded_miles=r['loaded_miles'],empty_miles=r['empty_miles']) for r in loads]
-            fuel=[]
-            if driver['fuel_card']:
-                fuel=[dict(r) for r in query('''SELECT f.* FROM fuel_transactions f WHERE f.card=? AND f.purchased_on<=?
-                      AND NOT EXISTS (SELECT 1 FROM driver_fuel_report_items i WHERE i.transaction_id=f.id AND i.active=1)
-                      ORDER BY f.purchased_on,f.transaction_no''',(driver['fuel_card'],end))]
             adjustments=[]
             adjustment=amount(request.args.get('adjustment_amount'),optional=True,nonnegative=True)
             if adjustment is not None:
@@ -152,8 +146,8 @@ def register_statements(app, query, query_one, execute, page, esc, postgres):
                       statement_no=request.args.get('statement_no','').strip() or f'DR-{driver_id}-{start.replace("-","")}-{end.replace("-","")}',
                       statement_date=datetime.now().strftime('%m/%d/%Y'),start=start,end=end,pay_rate=rate,
                       trucks=', '.join(sorted({r['truck_unit'] for r in loads if r['truck_unit']})),
-                      notes='Fuel is shown for reference only and is not deducted from this check. Fuel coverage is based only on imported purchases and saved fuel reports.')
-            result=render_statement(info,trips,adjustments,fuel)
+                      notes='')
+            result=render_statement(info,trips,adjustments)
         except (ValueError,TypeError) as exc:
             return error(str(exc))
         return send_file(BytesIO(result),mimetype='application/pdf',as_attachment=True,
@@ -162,7 +156,7 @@ def register_statements(app, query, query_one, execute, page, esc, postgres):
     return fields,controls
 
 
-def render_statement(info, trips, adjustments, fuel=None):
+def render_statement(info, trips, adjustments):
     result = calculate(trips, info.get('pay_rate'), adjustments)
     stream = BytesIO()
     doc = SimpleDocTemplate(stream, pagesize=letter, rightMargin=30, leftMargin=30,
@@ -231,18 +225,7 @@ def render_statement(info, trips, adjustments, fuel=None):
     credits.append([p('Total adjustments:','small'),'',p(money(result['adjustments']),'small')])
     story.append(KeepTogether([grid(credits,[382,80,90]),Spacer(1,10),
                               Table([['',p('Check Amount:', 'header'),p(money(result['check']), 'header')]],colWidths=[342,110,100])]))
-    story += [Spacer(1,10),p('Report preview. Downloading this PDF does not finalize a payment or mark fuel as reported. Save fuel coverage in the program after reviewing.', 'small')]
-    if fuel is not None:
-        story += [Spacer(1,14),p('Fuel purchases — reference only, not deducted', 'header'),
-                  p('Matching is by fuel card. Earlier purchases below were not included in an active saved fuel report. Net cost includes transaction fees.', 'small')]
-        fuel_data=[[p(v,'small') for v in ['Purchase date','Card','Transaction','Merchant / Location','Net cost','Coverage']]]
-        for f in fuel:
-            fuel_data.append([p(f['purchased_on'],'small'),p('****'+f['card'],'small'),p(f['transaction_no'],'small'),
-                              p((f.get('merchant') or '')+'\n'+(f.get('location') or ''),'small'),
-                              p(money(Decimal(f['cents'])/100),'small'),p('Earlier unreported' if f['purchased_on']<info['start'] else 'Within dates','small')])
-        if not fuel:
-            fuel_data.append([p('No unreported imported fuel through the end date.','small')]+['']*5)
-        story.append(grid(fuel_data,[65,55,85,190,65,92]))
+    story += [Spacer(1,10),p('Report preview. Downloading this PDF does not finalize a payment.', 'small')]
     if info.get('notes'):
         story += [Spacer(1,12),p(info['notes'],'small')]
 
