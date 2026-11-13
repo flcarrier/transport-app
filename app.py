@@ -1,6 +1,7 @@
 from flask import Flask, request, redirect, render_template_string, jsonify, send_from_directory, send_file
 import os
 import sqlite3
+from driver_statement import mileage_input
 
 # PostgreSQL driver is imported lazily inside db().
 # This avoids Render startup issues where a top-level import can fail silently.
@@ -1242,12 +1243,17 @@ def drivers():
             raw_card = request.form.get("fuel_card", "").strip()
             try:
                 from fuel_reports import card_suffix
+                from driver_statement import amount
+                from decimal import Decimal
                 card = card_suffix(raw_card) if raw_card else None
+                pay_rate = amount(request.form.get("pay_rate_per_mile"), optional=True, nonnegative=True)
+                if pay_rate is not None and pay_rate != pay_rate.quantize(Decimal('.0001')):
+                    raise ValueError("Enter a pay rate with no more than four decimal places.")
             except ValueError as exc:
                 return page(f"<p>{html_attr(str(exc))}</p><a href='/drivers'>Back to Drivers</a>"), 400
             if card and query_one("SELECT id FROM drivers WHERE fuel_card=?", (card,)):
                 return page("<p>That fuel card is already assigned to another driver.</p><a href='/drivers'>Back to Drivers</a>"), 400
-            execute("INSERT INTO drivers (name, fuel_card) VALUES (?, ?)", (name, card))
+            execute("INSERT INTO drivers (name, fuel_card, pay_rate_per_mile) VALUES (?, ?, ?)", (name, card, str(pay_rate) if pay_rate is not None else None))
         return redirect("/drivers")
 
     rows = query("SELECT * FROM drivers WHERE COALESCE(is_deleted, 0) = 0 ORDER BY name")
@@ -1282,6 +1288,7 @@ def drivers():
               <button type='submit'>Save Edit</button>
             </form>
             {fuel_driver_fields(r['id'], r['fuel_card'])}
+            {statement_driver_fields(r)}
           </td>
           <td>
             <form method='post' action='/drivers/{r['id']}/upload' enctype='multipart/form-data'>
@@ -1308,6 +1315,7 @@ def drivers():
         <h1>Drivers</h1>
         <form method='post'>
           <input name='name' placeholder='Driver name' required>
+          <label>Driver pay per mile ($)<input name='pay_rate_per_mile' type='number' min='0' step='0.0001' placeholder='Optional: enter agreed pay rate'></label>
           <label>Fuel card — last 5 digits shown in WEX<input name='fuel_card' inputmode='numeric' pattern='[0-9]{{5}}' maxlength='5' placeholder='Optional: 01531'></label>
           <button>Add</button>
         </form>
@@ -1517,15 +1525,20 @@ def delete_trailer(trailer_id):
 
 def loads():
     if request.method == "POST":
+        try:
+            loaded_miles = mileage_input(request.form.get("loaded_miles"))
+            empty_miles = mileage_input(request.form.get("empty_miles"))
+        except ValueError as exc:
+            return page(f"<p>{html_attr(str(exc))}</p><a href='/loads'>Back to Loads</a>"), 400
         execute(
             """
             INSERT INTO loads (
                 load_no, broker_load_no, trailer_id, optional_stop_1, optional_stop_1_zip, optional_stop_2, optional_stop_2_zip,
                 pickup_location_name, pickup_address, origin, origin_zip,
                 delivery_location_name, delivery_address, destination, destination_zip,
-                pickup_date, pickup_time, delivery_date, delivery_time, rate, status, driver_id, truck_id, customer_id
+                pickup_date, pickup_time, delivery_date, delivery_time, rate, status, driver_id, truck_id, customer_id, loaded_miles, empty_miles
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 request.form.get("load_no"),
@@ -1552,6 +1565,7 @@ def loads():
                 request.form.get("driver_id") or None,
                 request.form.get("truck_id") or None,
                 request.form.get("customer_id") or None,
+                loaded_miles, empty_miles,
             ),
         )
         return redirect("/loads")
@@ -1707,6 +1721,8 @@ def loads():
             <input name='optional_stop_2' placeholder='Optional Stop 2'>
             <input name='optional_stop_2_zip' placeholder='Optional Stop 2 ZIP'>
             <input name='rate' placeholder='Rate'>
+            <label>Paid loaded miles<input type='number' min='0' step='0.01' name='loaded_miles'></label>
+            <label>Paid empty miles<input type='number' min='0' step='0.01' name='empty_miles'></label>
             <select name='status'>
               {''.join(f"<option value='{s}'>{s}</option>" for s in LOAD_STATUSES)}
             </select>
@@ -1876,6 +1892,11 @@ def edit_load(load_id):
         return "Load not found", 404
 
     if request.method == "POST":
+        try:
+            loaded_miles = mileage_input(request.form.get("loaded_miles", load["loaded_miles"]))
+            empty_miles = mileage_input(request.form.get("empty_miles", load["empty_miles"]))
+        except ValueError as exc:
+            return page(f"<p>{html_attr(str(exc))}</p><a href='/loads'>Back to Loads</a>"), 400
         execute(
             """
             UPDATE loads
@@ -1883,7 +1904,7 @@ def edit_load(load_id):
                 pickup_location_name = ?, pickup_address = ?, origin = ?, origin_zip = ?,
                 delivery_location_name = ?, delivery_address = ?, destination = ?, destination_zip = ?,
                 pickup_date = ?, pickup_time = ?, delivery_date = ?, delivery_time = ?, rate = ?, status = ?,
-                driver_id = ?, truck_id = ?, trailer_id = ?, customer_id = ?
+                driver_id = ?, truck_id = ?, trailer_id = ?, customer_id = ?, loaded_miles = ?, empty_miles = ?
             WHERE id = ?
             """,
             (
@@ -1912,6 +1933,7 @@ def edit_load(load_id):
                 request.form.get("truck_id") or None,
                 request.form.get("trailer_id") or None,
                 request.form.get("customer_id") or None,
+                loaded_miles, empty_miles,
                 load_id,
             ),
         )
@@ -1971,6 +1993,8 @@ def edit_load(load_id):
           <input name='optional_stop_2_zip' placeholder='Optional Stop 2 ZIP' value='{html_attr(load['optional_stop_2_zip'])}'>
 
           <input name='rate' placeholder='Rate' value='{load['rate'] or ''}'>
+          <label>Paid loaded miles<input type='number' min='0' step='0.01' name='loaded_miles' value='{html_attr(load["loaded_miles"])}'></label>
+          <label>Paid empty miles<input type='number' min='0' step='0.01' name='empty_miles' value='{html_attr(load["empty_miles"])}'></label>
           <select name='status'>{status_opts}</select>
           <select name='driver_id'>{driver_opts}</select>
           <select name='truck_id'>{truck_opts}</select>
@@ -2833,13 +2857,15 @@ def driver_report():
     return page(f"""
     <div class='card'>
       <h1>Driver Report</h1>
-      <form>
+      <form action='/driver-loads/pdf'>
         <select name='driver_id' required>{opts}</select>
         <label>Start date</label>
-        <input type='date' name='start' value='{html_attr(start)}'>
+        <input type='date' name='start' value='{html_attr(start)}' required>
         <label>End date</label>
-        <input type='date' name='end' value='{html_attr(end)}'>
-        <button>Run</button>
+        <input type='date' name='end' value='{html_attr(end)}' required>
+        {statement_report_controls()}
+        <button>Run / Download PDF</button>
+        <button formaction='/driver-loads'>Preview Loads / Save Fuel Coverage</button>
       </form>
       <table>
         <tr>
@@ -3220,6 +3246,9 @@ execute("""CREATE TABLE IF NOT EXISTS billing_attachments (
 from fuel_reports import register_fuel
 fuel_driver_fields, fuel_report_section = register_fuel(
     app, db, query, query_one, execute, normalize_sql, page, html_attr, USE_POSTGRES)
+from driver_statement import register_statements
+statement_driver_fields, statement_report_controls = register_statements(
+    app, query, query_one, execute, page, html_attr, USE_POSTGRES)
 app.logger.warning("Database initialized: %s", "PostgreSQL" if USE_POSTGRES else "local SQLite")
 
 
