@@ -130,7 +130,7 @@ def register_fuel(app, db, query, query_one, execute, normalize_sql, page, esc, 
           <input name='fuel_card' inputmode='numeric' pattern='[0-9]{{5}}' maxlength='5'
                  value='{esc(value)}' placeholder='Example: 01531'></label>
           <button type='submit'>Save Fuel Card</button>
-          <small>Match reports by card, not driver name. Clear this field before transferring a card to another driver.</small>
+          <small>Match reports by card, not driver name. Cards on deleted driver profiles can be reused. Clear an active driver's assignment before transferring their card.</small>
         </form>"""
 
     @app.route('/drivers/<int:driver_id>/fuel-card', methods=['POST'])
@@ -143,10 +143,19 @@ def register_fuel(app, db, query, query_one, execute, normalize_sql, page, esc, 
             card = card_suffix(raw) if raw else None
         except ValueError as exc:
             return error(str(exc))
-        if card and query_one('SELECT id FROM drivers WHERE fuel_card=? AND id != ?', (card, driver_id)):
-            return error('That card is already assigned to another driver. Clear the old assignment first.')
         try:
-            execute('UPDATE drivers SET fuel_card=? WHERE id=?', (card, driver_id))
+            with closing(db()) as conn:
+                try:
+                    if card:
+                        owner=run(conn,'SELECT id,is_deleted FROM drivers WHERE fuel_card=? AND id != ?', (card,driver_id)).fetchone()
+                        if owner and not owner['is_deleted']:
+                            return error('That card is assigned to an active driver. Clear the old assignment first.')
+                        run(conn,'UPDATE drivers SET fuel_card=NULL WHERE fuel_card=? AND is_deleted=1', (card,))
+                    run(conn,'UPDATE drivers SET fuel_card=? WHERE id=? AND COALESCE(is_deleted,0)=0', (card,driver_id))
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
         except Exception:
             app.logger.exception('Could not save fuel card assignment')
             return error('The card assignment could not be saved. Refresh and check whether it is already assigned.', 409)
