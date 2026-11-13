@@ -36,6 +36,8 @@ def calculate(trips, rate, adjustments):
     for trip in trips:
         loaded = amount(trip.get('loaded_miles'), optional=True, nonnegative=True)
         empty = amount(trip.get('empty_miles'), optional=True, nonnegative=True)
+        if empty is None:
+            empty = Decimal('0')
         total = loaded + empty if loaded is not None and empty is not None else None
         pay = (total * rate).quantize(Decimal('.01'), rounding=ROUND_HALF_UP) if total is not None and rate is not None else None
         complete = complete and pay is not None
@@ -143,7 +145,7 @@ def register_statements(app, query, query_one, execute, page, esc, postgres, tri
             empty_key=f"empty_miles_{row['id']}"
             if empty_key not in request.form:
                 continue
-            empty=mileage_input(request.form.get(empty_key,row['empty_miles']))
+            empty=mileage_input(request.form.get(empty_key,row['empty_miles'])) or '0'
             changes.append((row['id'],empty))
             row['empty_miles']=empty
         if changes and persist:

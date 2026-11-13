@@ -2836,7 +2836,7 @@ def driver_report():
         mileage_items = []
         for r in data:
             total_miles = driver_trip_total_miles(r)
-            empty_value = r["empty_miles"]
+            empty_value = r["empty_miles"] if r["empty_miles"] is not None else "0"
             mileage_hint = "From Trip Details Total Miles" if total_miles is not None else "Trip Details miles unavailable; check the trip ZIP codes"
             mileage_items.append(
                 f"<tr><td>{html_attr(r['load_no'])}</td><td>{html_attr(r['delivery_date'] or r['pickup_date'])}</td>"
@@ -2883,7 +2883,7 @@ def driver_report():
         <button formaction='/driver-loads/miles' formmethod='post'>Save Miles</button>
       </form>
       <p><strong>{rate_message}</strong></p><p role='status'>{saved_message}</p>
-      <p>Load trips for the selected dates, enter empty miles below, then Save Miles or Run / Download PDF. Enter 0 when there are no empty miles. Loaded miles automatically come from Trip Details Total Miles.</p>
+      <p>Load trips for the selected dates, enter empty miles below, then Save Miles or Run / Download PDF. Empty miles default to 0; enter additional empty miles when applicable. Loaded miles automatically come from Trip Details Total Miles.</p>
       <h2>Paid Miles for This Report</h2>
       <div style='overflow-x:auto;'><table><tr><th>Trip #</th><th>Date</th><th>Route</th><th>Loaded Miles</th><th>Empty Miles</th></tr>{mileage_rows}</table></div>
       <h2>Trip Details</h2>
