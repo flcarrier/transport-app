@@ -329,6 +329,13 @@ def format_miles(value):
     return f"{value:,.1f}"
 
 
+def driver_trip_total_miles(load):
+    miles = total_route_miles(load["origin_zip"], load["optional_stop_1_zip"],
+                              load["optional_stop_2_zip"], load["destination_zip"])
+    # Match the Total Miles value displayed in Trip Details exactly.
+    return float(f"{miles:.1f}") if miles is not None else None
+
+
 def unique_file_path(folder, filename):
     base, ext = os.path.splitext(filename)
     candidate = os.path.join(folder, filename)
@@ -1721,7 +1728,6 @@ def loads():
             <input name='optional_stop_2' placeholder='Optional Stop 2'>
             <input name='optional_stop_2_zip' placeholder='Optional Stop 2 ZIP'>
             <input name='rate' placeholder='Rate'>
-            <label>Paid loaded miles<input type='number' min='0' step='0.01' name='loaded_miles'></label>
             <label>Paid empty miles<input type='number' min='0' step='0.01' name='empty_miles'></label>
             <select name='status'>
               {''.join(f"<option value='{s}'>{s}</option>" for s in LOAD_STATUSES)}
@@ -1993,7 +1999,6 @@ def edit_load(load_id):
           <input name='optional_stop_2_zip' placeholder='Optional Stop 2 ZIP' value='{html_attr(load['optional_stop_2_zip'])}'>
 
           <input name='rate' placeholder='Rate' value='{load['rate'] or ''}'>
-          <label>Paid loaded miles<input type='number' min='0' step='0.01' name='loaded_miles' value='{html_attr(load["loaded_miles"])}'></label>
           <label>Paid empty miles<input type='number' min='0' step='0.01' name='empty_miles' value='{html_attr(load["empty_miles"])}'></label>
           <select name='status'>{status_opts}</select>
           <select name='driver_id'>{driver_opts}</select>
@@ -2830,21 +2835,13 @@ def driver_report():
         report_rows = []
         mileage_items = []
         for r in data:
-            total_miles = total_route_miles(
-                r["origin_zip"],
-                r["optional_stop_1_zip"],
-                r["optional_stop_2_zip"],
-                r["destination_zip"],
-            )
-            loaded_value = r["loaded_miles"]
+            total_miles = driver_trip_total_miles(r)
             empty_value = r["empty_miles"]
-            estimated_hint = f"Route estimate: {total_miles:,.2f} miles" if total_miles is not None else "Enter paid loaded miles"
-            if loaded_value is not None and empty_value is not None:
-                total_miles = float(loaded_value) + float(empty_value)
+            mileage_hint = "From Trip Details Total Miles" if total_miles is not None else "Trip Details miles unavailable; check the trip ZIP codes"
             mileage_items.append(
                 f"<tr><td>{html_attr(r['load_no'])}</td><td>{html_attr(r['delivery_date'] or r['pickup_date'])}</td>"
-                f"<td>{html_attr(r['origin'])} to {html_attr(r['destination'])}<br><small>{estimated_hint}</small></td>"
-                f"<td><input form='driver-report-form' type='number' min='0' step='0.01' style='min-width:90px;' name='loaded_miles_{r['id']}' value='{html_attr(loaded_value)}' aria-label='Loaded miles for load {r['id']}'></td>"
+                f"<td>{html_attr(r['origin'])} to {html_attr(r['destination'])}<br><small>{mileage_hint}</small></td>"
+                f"<td>{format_miles(total_miles)}</td>"
                 f"<td><input form='driver-report-form' type='number' min='0' step='0.01' style='min-width:90px;' name='empty_miles_{r['id']}' value='{html_attr(empty_value)}' aria-label='Empty miles for load {r['id']}'></td></tr>")
             report_rows.append(
                 f"<tr>"
@@ -2886,7 +2883,7 @@ def driver_report():
         <button formaction='/driver-loads/miles' formmethod='post'>Save Miles</button>
       </form>
       <p><strong>{rate_message}</strong></p><p role='status'>{saved_message}</p>
-      <p>Load trips for the selected dates, enter loaded and empty miles below, then Save Miles or Run / Download PDF. Enter 0 when there are no empty miles. Route estimates are shown as a reference; only entered miles are used for payment.</p>
+      <p>Load trips for the selected dates, enter empty miles below, then Save Miles or Run / Download PDF. Enter 0 when there are no empty miles. Loaded miles automatically come from Trip Details Total Miles.</p>
       <h2>Paid Miles for This Report</h2>
       <div style='overflow-x:auto;'><table><tr><th>Trip #</th><th>Date</th><th>Route</th><th>Loaded Miles</th><th>Empty Miles</th></tr>{mileage_rows}</table></div>
       <h2>Trip Details</h2>
@@ -2902,7 +2899,7 @@ def driver_report():
           <th>Stop 2 ZIP</th>
           <th>Destination</th>
           <th>Destination ZIP</th>
-          <th>Total Miles / Route Estimate</th>
+          <th>Total Miles</th>
           <th>Load Amount</th>
           <th>Status</th>
         </tr>
@@ -3271,7 +3268,7 @@ fuel_driver_fields, fuel_report_section = register_fuel(
     app, db, query, query_one, execute, normalize_sql, page, html_attr, USE_POSTGRES)
 from driver_statement import register_statements
 statement_driver_fields, statement_report_controls = register_statements(
-    app, query, query_one, execute, page, html_attr, USE_POSTGRES)
+    app, query, query_one, execute, page, html_attr, USE_POSTGRES, driver_trip_total_miles)
 app.logger.warning("Database initialized: %s", "PostgreSQL" if USE_POSTGRES else "local SQLite")
 
 

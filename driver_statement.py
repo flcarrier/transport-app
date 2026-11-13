@@ -62,7 +62,7 @@ def mileage_input(value):
     return str(value) if value is not None else None
 
 
-def register_statements(app, query, query_one, execute, page, esc, postgres):
+def register_statements(app, query, query_one, execute, page, esc, postgres, trip_miles):
     for table, columns in [('drivers', ['payee_name','mailing_address','pay_rate_per_mile']),
                            ('loads', ['loaded_miles','empty_miles'])]:
         existing = set() if postgres else {r['name'] for r in query(f'PRAGMA table_info({table})')}
@@ -100,11 +100,11 @@ def register_statements(app, query, query_one, execute, page, esc, postgres):
 
     def controls():
         return """<details><summary>PDF statement options</summary>
-          <p>The PDF uses the driver's saved payment details and the loaded/empty miles entered on each load.</p>
+          <p>The PDF uses the driver's saved payment details, loaded miles from Trip Details Total Miles, and the empty miles entered for each trip.</p>
           <label>Statement number (optional)<input name='statement_no'></label>
           <label>Company address (optional)<textarea name='company_address'></textarea></label>
           <label>Remit-to information (optional)<textarea name='remit_to'></textarea></label>
-          <p>The PDF uses the driver's saved rate per mile and entered loaded/empty miles.</p>
+          <p>The PDF uses the driver's saved rate per mile. Loaded miles come from Trip Details Total Miles.</p>
           <h3>Credits and deductions (optional)</h3>
           <label>Description<input name='adjustment_description' placeholder='Example: Expense reimbursement'></label>
           <label>Amount ($)<input type='number' min='0' step='0.01' name='adjustment_amount'></label>
@@ -140,21 +140,18 @@ def register_statements(app, query, query_one, execute, page, esc, postgres):
                     if load_id not in valid_ids:
                         raise ValueError('The mileage form includes a trip outside this driver and date range. Reload the trip list.')
         for row in loads:
-            loaded_key,empty_key=f"loaded_miles_{row['id']}",f"empty_miles_{row['id']}"
-            if loaded_key not in request.form and empty_key not in request.form:
+            empty_key=f"empty_miles_{row['id']}"
+            if empty_key not in request.form:
                 continue
-            loaded=mileage_input(request.form.get(loaded_key,row['loaded_miles']))
             empty=mileage_input(request.form.get(empty_key,row['empty_miles']))
-            changes.append((row['id'],loaded,empty))
-            row['loaded_miles'],row['empty_miles']=loaded,empty
+            changes.append((row['id'],empty))
+            row['empty_miles']=empty
         if changes and persist:
             cases=' '.join('WHEN ? THEN ?' for _ in changes)
             placeholders=','.join('?' for _ in changes)
             args=tuple(v for row in changes for v in (row[0],row[1]))
-            args+=tuple(v for row in changes for v in (row[0],row[2]))
             args+=(driver['id'],)+tuple(row[0] for row in changes)
-            execute(f'''UPDATE loads SET loaded_miles=CASE id {cases} ELSE loaded_miles END,
-                        empty_miles=CASE id {cases} ELSE empty_miles END
+            execute(f'''UPDATE loads SET empty_miles=CASE id {cases} ELSE empty_miles END
                         WHERE driver_id=? AND id IN ({placeholders}) AND COALESCE(is_deleted,0)=0''',args)
 
     @app.route('/driver-loads/miles',methods=['POST'])
@@ -178,7 +175,7 @@ def register_statements(app, query, query_one, execute, page, esc, postgres):
                 save_report_miles(driver,loads,persist=False)
             trips=[dict(load_no=r['load_no'],date=r['delivery_date'] or r['pickup_date'],
                         route=' - '.join(filter(None,[r['origin'],r['optional_stop_1'],r['optional_stop_2'],r['destination']])),
-                        loaded_miles=r['loaded_miles'],empty_miles=r['empty_miles']) for r in loads]
+                        loaded_miles=trip_miles(r),empty_miles=r['empty_miles']) for r in loads]
             adjustments=[]
             adjustment=amount(request.values.get('adjustment_amount'),optional=True,nonnegative=True)
             if adjustment is not None:
@@ -259,7 +256,7 @@ def render_statement(info, trips, adjustments):
         if result['rate'] is None:
             missing.append('driver pay rate in the profile')
         if any(r['loaded'] is None for r in result['items']):
-            missing.append('loaded miles')
+            missing.append('Trip Details Total Miles for one or more trips')
         if any(r['empty'] is None for r in result['items']):
             missing.append('empty miles')
         story += [p('INCOMPLETE: Missing ' + ', '.join(missing) + '. Enter the missing values on the Driver Report tab. The check amount has not been calculated.', 'warning'), Spacer(1,8)]
