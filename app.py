@@ -1548,6 +1548,16 @@ def delete_trailer(trailer_id):
     return redirect("/trucks")
 
 
+def next_internal_load_number():
+    # Follow the last entered numeric internal number, not the broker number.
+    # Keep deleted records in the sequence so their numbers are not reused.
+    for row in query("SELECT load_no FROM loads ORDER BY id DESC"):
+        value = str(row["load_no"] or "").strip()
+        if re.fullmatch(r"[0-9]+", value):
+            return str(int(value) + 1).zfill(len(value))
+    return ""
+
+
 @app.route("/loads", methods=["GET", "POST"])
 
 def loads():
@@ -1724,7 +1734,7 @@ def loads():
         {closed_loads_awaiting_invoices()}
         <form method='post' id='load-form'>
           <div class='form-grid'>
-            <input name='load_no' placeholder='Load # / Internal Load #' required>
+            <label>Internal Load # (editable)<input name='load_no' placeholder='Load # / Internal Load #' value='{html_attr(next_internal_load_number())}' required></label>
             <input name='broker_load_no' placeholder='Broker Load #'>
             <div class='customer-search-box'>
               <input type='text' id='customer_search' placeholder='Type customer name' autocomplete='off'>
