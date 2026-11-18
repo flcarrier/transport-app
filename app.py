@@ -148,7 +148,7 @@ BASE_HTML = """
       resize: vertical;
       white-space: pre-wrap;
     }
-    .customer-list-card { overflow-x: auto; }
+    .customer-list-card { overflow-x: auto; grid-column: 1 / -1; min-width: 0; }
 
     .invoiced-load td { background: #eeeeee !important; color: #666; }
     .invoiced-badge { display: inline-block; padding: 6px 10px; border-radius: 8px; background: #d9ead3; color: #274e13; font-weight: bold; }
@@ -1072,7 +1072,7 @@ def dashboard():
     load_count = query_one("SELECT COUNT(*) AS count FROM loads WHERE COALESCE(is_deleted, 0) = 0")["count"]
     driver_count = query_one("SELECT COUNT(*) AS count FROM drivers WHERE COALESCE(is_deleted, 0) = 0")["count"]
     truck_count = query_one("SELECT COUNT(*) AS count FROM trucks")["count"]
-    customer_count = query_one("SELECT COUNT(*) AS count FROM customers")["count"]
+    customer_count = query_one("SELECT COUNT(*) AS count FROM customers WHERE COALESCE(is_deleted,0)=0")["count"]
     delivered_count = query_one("SELECT COUNT(*) AS count FROM loads WHERE status='Delivered' AND COALESCE(is_deleted, 0) = 0")["count"]
     file_count = query_one("SELECT COUNT(*) AS count FROM load_files")["count"]
     invoice_count = query_one("SELECT COUNT(*) AS count FROM invoices")["count"]
@@ -1111,19 +1111,22 @@ def customers():
             )
         return redirect("/customers")
 
-    rows = query("SELECT * FROM customers ORDER BY name")
+    rows = query("SELECT * FROM customers WHERE COALESCE(is_deleted,0)=0 ORDER BY name")
     tr = ""
     for r in rows:
         tr += f"""
         <tr>
-          <form method='post' action='/customers/{r['id']}/edit'>
-            <td><textarea name='name' required>{html_attr(r['name'])}</textarea></td>
-            <td><textarea name='address'>{html_attr(r['address'])}</textarea></td>
-            <td><textarea name='phone'>{html_attr(r['phone'])}</textarea></td>
-            <td><textarea name='fax'>{html_attr(r['fax'])}</textarea></td>
-            <td><textarea name='email'>{html_attr(r['email'])}</textarea></td>
-            <td><button type='submit'>Save Edit</button></td>
-          </form>
+            <td><textarea form='customer-edit-{r['id']}' name='name' required>{html_attr(r['name'])}</textarea></td>
+            <td><textarea form='customer-edit-{r['id']}' name='address'>{html_attr(r['address'])}</textarea></td>
+            <td><textarea form='customer-edit-{r['id']}' name='phone'>{html_attr(r['phone'])}</textarea></td>
+            <td><textarea form='customer-edit-{r['id']}' name='fax'>{html_attr(r['fax'])}</textarea></td>
+            <td><textarea form='customer-edit-{r['id']}' name='email'>{html_attr(r['email'])}</textarea></td>
+            <td>
+              <form id='customer-edit-{r['id']}' method='post' action='/customers/{r['id']}/edit'><button type='submit'>Save Edit</button></form>
+              <form method='post' action='/customers/{r['id']}/delete' onsubmit="return confirm('Delete this customer from the customer list? Existing loads and invoices will be kept.');">
+                <button type='submit' style='background:#ffdddd;'>Delete Customer</button>
+              </form>
+            </td>
         </tr>
         """
 
@@ -1131,6 +1134,7 @@ def customers():
         tr = "<tr><td colspan='6'>No customers yet.</td></tr>"
 
     return page(f"""
+    {deleted_records_panel('customers')}
     <div class='grid'>
       <div class='card'>
         <h1>Customers</h1>
@@ -1153,6 +1157,22 @@ def customers():
       </div>
     </div>
     """)
+
+
+@app.route("/customers/<int:customer_id>/delete", methods=["POST"])
+def delete_customer(customer_id):
+    if not query_one("SELECT id FROM customers WHERE id=?", (customer_id,)):
+        return "Customer not found", 404
+    execute("UPDATE customers SET is_deleted=1 WHERE id=?", (customer_id,))
+    return redirect("/customers")
+
+
+@app.route("/customers/<int:customer_id>/restore", methods=["POST"])
+def restore_customer(customer_id):
+    if not query_one("SELECT id FROM customers WHERE id=?", (customer_id,)):
+        return "Customer not found", 404
+    execute("UPDATE customers SET is_deleted=0 WHERE id=?", (customer_id,))
+    return redirect("/customers")
 
 
 @app.route("/customers/<int:customer_id>/edit", methods=["POST"])
@@ -1180,7 +1200,7 @@ def search_customers():
 
     like_term = f"%{term}%"
     rows = query(
-        "SELECT id, name, address, phone, fax, email FROM customers WHERE name LIKE ? ORDER BY name LIMIT 10",
+        "SELECT id, name, address, phone, fax, email FROM customers WHERE COALESCE(is_deleted,0)=0 AND name LIKE ? ORDER BY name LIMIT 10",
         (like_term,),
     )
     return jsonify([
@@ -1945,7 +1965,7 @@ def edit_load(load_id):
         )
         return redirect("/loads")
 
-    customers = query("SELECT * FROM customers ORDER BY name")
+    customers = query("SELECT * FROM customers WHERE COALESCE(is_deleted,0)=0 OR id=? ORDER BY name", (load["customer_id"],))
     drivers = query("SELECT * FROM drivers WHERE COALESCE(is_deleted, 0) = 0 OR id = ? ORDER BY name", (load["driver_id"],))
     trucks = query("SELECT * FROM trucks ORDER BY unit_no")
     trailers = query("SELECT * FROM trailers ORDER BY trailer_no")
@@ -2236,6 +2256,15 @@ def update_status(id):
     return redirect("/loads")
 
 
+def new_invoice_number_for_load(load):
+    number = str(load["load_no"] or "").strip()
+    if not number:
+        raise ValueError("Enter an internal load number on the load before creating its invoice.")
+    if query_one("SELECT id FROM invoices WHERE invoice_no=?", (number,)):
+        raise ValueError("An invoice already uses this internal load number. Open the existing invoice or correct the internal load number before creating another invoice.")
+    return number
+
+
 @app.route("/invoices", methods=["GET", "POST"])
 def invoices():
     if request.method == "POST":
@@ -2247,6 +2276,14 @@ def invoices():
         terms = request.form.get("terms", "").strip() or "NET 30"
         due_date = request.form.get("due_date") or None
         load_id = request.form.get("load_id") or None
+        if load_id:
+            linked_load = query_one("SELECT id,load_no FROM loads WHERE id=? AND COALESCE(is_deleted,0)=0", (load_id,))
+            if not linked_load:
+                return "Select an existing load.", 400
+            try:
+                invoice_no = new_invoice_number_for_load(linked_load)
+            except ValueError as exc:
+                return page(f"<p>{html_attr(str(exc))}</p><a href='/invoices'>Back to Invoices</a>"), 400
         line_date = request.form.get("line_date") or None
         truck_no = request.form.get("truck_no", "").strip()
         load_no = request.form.get("load_no", "").strip()
@@ -2279,7 +2316,7 @@ def invoices():
         )
         return redirect("/invoices")
 
-    customers = query("SELECT * FROM customers ORDER BY name")
+    customers = query("SELECT * FROM customers WHERE COALESCE(is_deleted,0)=0 ORDER BY name")
     loads_list = query("""
         SELECT l.*, c.name AS customer_name, c.address AS customer_address, t.unit_no AS truck_unit, tr.trailer_no AS trailer_no
         FROM loads l
@@ -2314,6 +2351,7 @@ def invoices():
             f"data-address='{html_attr(l['customer_address'])}' "
             f"data-truck='{html_attr(' / '.join(part for part in [l['truck_unit'] or '', 'Trailer ' + l['trailer_no'] if l['trailer_no'] else ''] if part))}' "
             f"data-loadno='{html_attr(l['broker_load_no'] or l['load_no'])}' "
+            f"data-internalno='{html_attr(l['load_no'])}' "
             f"data-origin='{html_attr(((l['pickup_location_name'] or '') + ' ' + (l['pickup_address'] or '') + ' ' + (l['origin'] or '')).strip())}' "
             f"data-destination='{html_attr(((l['delivery_location_name'] or '') + ' ' + (l['delivery_address'] or '') + ' ' + (l['destination'] or '')).strip())}' "
             f"data-rate='{l['rate'] or 0}' "
@@ -2429,7 +2467,7 @@ def invoices():
         <h1>Invoices</h1>
         <form method='post' id='invoice-form'>
           <div class='form-grid'>
-            <input name='invoice_no' id='invoice_no' placeholder='Invoice #' value='{next_invoice_no}' required>
+            <label>Invoice # (uses the linked load's internal number)<input name='invoice_no' id='invoice_no' placeholder='Invoice #' value='{next_invoice_no}' required></label>
             <input type='date' name='invoice_date' id='invoice_date' value='{today_ymd()}' required>
             <input name='terms' id='terms' placeholder='Terms' value='NET 30'>
             <input type='date' name='due_date' id='due_date' value='{plus_30_days_ymd()}' required>
@@ -2537,6 +2575,7 @@ def invoices():
           lineDate.value = opt.dataset.pickup || '';
           truckNo.value = opt.dataset.truck || '';
           loadNo.value = opt.dataset.loadno || '';
+          document.getElementById('invoice_no').value = opt.dataset.internalno || '';
           originText.value = opt.dataset.origin || '';
           destinationText.value = opt.dataset.destination || '';
           rate.value = opt.dataset.rate || '0';
@@ -3190,14 +3229,10 @@ def create_invoice_from_load(load_id):
     if not load:
         return "Load not found", 404
 
-    next_invoice_row = query_one(
-        "SELECT MAX(CAST(invoice_no AS INTEGER)) AS max_no FROM invoices WHERE invoice_no GLOB '[0-9]*'"
-    )
-
-    if next_invoice_row and next_invoice_row["max_no"]:
-        next_invoice_no = str(int(next_invoice_row["max_no"]) + 1)
-    else:
-        next_invoice_no = "1"
+    try:
+        next_invoice_no = new_invoice_number_for_load(load)
+    except ValueError as exc:
+        return page(f"<p>{html_attr(str(exc))}</p><a href='/loads'>Back to Loads</a>"), 400
 
     invoice_date = today_ymd()
     due_date = plus_30_days_ymd()
@@ -3252,7 +3287,7 @@ def delete_invoice(invoice_id):
 
 
 init_db()
-for table in ("loads", "drivers"):
+for table in ("loads", "drivers", "customers"):
     if USE_POSTGRES:
         execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS is_deleted INTEGER DEFAULT 0")
     elif "is_deleted" not in {row["name"] for row in query(f"PRAGMA table_info({table})")}:
