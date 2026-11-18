@@ -1343,7 +1343,7 @@ def drivers():
         <form method='post'>
           <input name='name' placeholder='Driver name' required>
           <label>Driver pay per mile ($)<input name='pay_rate_per_mile' type='number' min='0' step='0.0001' placeholder='Optional: enter agreed pay rate'></label>
-          <label>Fuel card — last 5 digits shown in WEX<input name='fuel_card' inputmode='numeric' pattern='[0-9]{{5}}' maxlength='5' placeholder='Optional: 01531'></label>
+          <label>Fuel card — last 4 or 5 digits<input name='fuel_card' inputmode='numeric' pattern='[0-9]{{4,5}}' maxlength='5' placeholder='Optional: 01531'></label>
           <button>Add</button>
         </form>
       </div>
@@ -3311,6 +3311,8 @@ execute("""CREATE TABLE IF NOT EXISTS billing_attachments (
 from fuel_reports import register_fuel
 fuel_driver_fields, fuel_report_section = register_fuel(
     app, db, query, query_one, execute, normalize_sql, page, html_attr, USE_POSTGRES)
+from fuel_receipts import register_receipts
+register_receipts(app, db, query, query_one, execute, normalize_sql, page, html_attr, USE_POSTGRES)
 from driver_statement import register_statements
 statement_driver_fields, statement_report_controls = register_statements(
     app, query, query_one, execute, page, html_attr, USE_POSTGRES, driver_trip_total_miles)

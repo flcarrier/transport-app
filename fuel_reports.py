@@ -14,8 +14,8 @@ from flask import request, redirect
 
 def card_suffix(value):
     digits = re.sub(r'\D', '', str(value or ''))
-    if len(digits) < 5:
-        raise ValueError('Enter the last five digits of the card as shown in WEX.')
+    if len(digits) < 4:
+        raise ValueError('Enter the last four or five digits of the fuel card.')
     return digits[-5:]
 
 
@@ -126,8 +126,8 @@ def register_fuel(app, db, query, query_one, execute, normalize_sql, page, esc, 
     def driver_fields(driver_id, value):
         value = value or ''
         return f"""<form method='post' action='/drivers/{driver_id}/fuel-card'>
-          <label>Fuel card — last 5 digits shown in WEX
-          <input name='fuel_card' inputmode='numeric' pattern='[0-9]{{5}}' maxlength='5'
+          <label>Fuel card — last 4 or 5 digits
+          <input name='fuel_card' inputmode='numeric' pattern='[0-9]{{4,5}}' maxlength='5'
                  value='{esc(value)}' placeholder='Example: 01531'></label>
           <button type='submit'>Save Fuel Card</button>
           <small>Match reports by card, not driver name. Cards on deleted driver profiles can be reused. Clear an active driver's assignment before transferring their card.</small>
@@ -161,11 +161,14 @@ def register_fuel(app, db, query, query_one, execute, normalize_sql, page, esc, 
             return error('The card assignment could not be saved. Refresh and check whether it is already assigned.', 409)
         return redirect('/drivers')
 
-    def eligible(card, end):
+    def eligible(driver_id, card, end):
         return query('''SELECT f.* FROM fuel_transactions f
-                        WHERE f.card=? AND f.purchased_on<=?
+                        WHERE (f.driver_id=? OR (f.driver_id IS NULL AND f.card=? AND f.card!='')) AND f.purchased_on<=?
                           AND NOT EXISTS (SELECT 1 FROM driver_fuel_report_items i WHERE i.transaction_id=f.id AND i.active=1)
-                        ORDER BY f.purchased_on, f.transaction_no''', (card, end))
+                        ORDER BY f.purchased_on, f.transaction_no''', (driver_id, card or '', end))
+
+    def receipt_link(row):
+        return f"<br><a href='/fuel/receipts/{esc(row['receipt_id'])}'>View receipt</a>" if row['receipt_id'] else ''
 
     def table(rows, start, selectable=False):
         body = ''
@@ -175,7 +178,7 @@ def register_fuel(app, db, query, query_one, execute, normalize_sql, page, esc, 
                         f"value='{row['id']}' checked aria-label='Include transaction {esc(row['transaction_no'])}'></td>"
                         if selectable else '')
             body += (f"<tr>{checkbox}<td>{esc(row['purchased_on'])}</td><td>{esc(row['posted_on'])}</td>"
-                     f"<td>{esc(row['transaction_no'])}</td><td>****{esc(row['card'])}</td>"
+                     f"<td>{esc(row['transaction_no'])}{receipt_link(row)}</td><td>{('****'+esc(row['card'])) if row['card'] else 'Cash / no card'}</td>"
                      f"<td>{esc(row['asset'])}</td><td>{esc(row['merchant'])}<br>{esc(row['location'])}</td>"
                      f"<td>{esc(row['gallons'])}</td><td>${row['cents']/100:,.2f}</td>"
                      f"<td>{'Earlier unreported fuel' if older else 'Within date range'}</td></tr>")
@@ -194,18 +197,18 @@ def register_fuel(app, db, query, query_one, execute, normalize_sql, page, esc, 
         except ValueError as exc:
             return f"<p>{esc(str(exc))}</p>"
         driver = query_one('SELECT * FROM drivers WHERE id=?', (driver_id,))
-        if not driver or not driver['fuel_card']:
-            return "<div class='card'><h2>Driver fuel report</h2><p>Add this driver's fuel card on the Drivers page first.</p><a href='/drivers'>Set driver fuel card</a></div>"
+        if not driver:
+            return "<div class='card'><h2>Driver fuel report</h2><p>Select an existing driver first.</p><a href='/drivers'>Set driver fuel card</a></div>"
         card = driver['fuel_card']
-        rows = eligible(card, end)
+        rows = eligible(driver_id, card, end)
         earlier = sum(r['cents'] for r in rows if r['purchased_on'] < start)
         current = sum(r['cents'] for r in rows if r['purchased_on'] >= start)
         gallons = sum((Decimal(r['gallons']) for r in rows), Decimal('0'))
         saved = query('SELECT * FROM driver_fuel_reports WHERE driver_id=? ORDER BY saved_at DESC', (driver_id,))
         links = ''.join(f"<li><a href='/fuel/reports/{r['id']}'>{esc(r['start_date'])} through {esc(r['end_date'])} — {'VOIDED — ' if r['voided'] else ''}{'Previous report coverage' if r['kind']=='prior' else 'Saved fuel report'}</a></li>" for r in saved)
-        bounds = query_one('SELECT MIN(purchased_on) AS first_date, MAX(purchased_on) AS last_date, COUNT(*) AS n FROM fuel_transactions WHERE card=?', (card,))
-        info = (f"Imported purchases for this card: {esc(bounds['first_date'])} through {esc(bounds['last_date'])}. "
-                'This is only the history imported, not proof that every purchase is available.' if bounds['n'] else 'No transactions imported for this card.')
+        bounds = query_one("SELECT MIN(purchased_on) AS first_date, MAX(purchased_on) AS last_date, COUNT(*) AS n FROM fuel_transactions f WHERE f.driver_id=? OR (f.driver_id IS NULL AND f.card=? AND f.card!='')", (driver_id,card or ''))
+        info = (f"Saved/imported purchases for this driver: {esc(bounds['first_date'])} through {esc(bounds['last_date'])}. "
+                'This is only the history imported, not proof that every purchase is available.' if bounds['n'] else 'No fuel purchases saved or imported for this driver.')
         form = ''
         if rows:
             form = f"""<form method='post' action='/fuel/report/save'>
@@ -224,12 +227,12 @@ def register_fuel(app, db, query, query_one, execute, normalize_sql, page, esc, 
         else:
             form = '<p>No unreported fuel purchases through the end date were found in the imported history.</p>'
         return f"""<div class='card' style='margin-top:16px;'>
-          <h2>Driver fuel report — card ****{esc(card)}</h2>
-          <p>{esc(info)}</p><p><a href='/fuel'>Import posted WEX transactions</a></p>
+          <h2>Driver fuel report — {esc(driver['name'])}</h2>
+          <p>{esc(info)}</p><p><a href='/fuel/receipts'>Scan / Upload Fuel Receipt</a> · <a href='/fuel'>Fuel Reports</a></p>
           <p>Before the first new report, record purchases covered by your previous reports. Earlier purchases are not automatically assumed paid or covered.</p>
           <p>Within dates: <strong>${current/100:,.2f}</strong> · Earlier unreported: <strong>${earlier/100:,.2f}</strong>
           · Available total: <strong>${(current+earlier)/100:,.2f}</strong> · Gallons: {gallons:,.3f}</p>
-          <p>Amounts use WEX Net Cost, including transaction fees. Posted purchases only; purchases after {end} are excluded.
+          <p>Receipt amounts are the totals you confirmed; WEX amounts use posted Net Cost, including fees; purchases after {end} are excluded.
           Previewing does not mark anything reported. Only saving does.</p>{form}
           <h3>Previously saved fuel reports</h3><ul>{links or '<li>No prior fuel report coverage recorded yet.</li>'}</ul>
         </div>"""
@@ -237,25 +240,25 @@ def register_fuel(app, db, query, query_one, execute, normalize_sql, page, esc, 
     @app.route('/fuel', methods=['GET'])
     def fuel_home():
         cards = query('''SELECT card, COUNT(*) AS n, MIN(purchased_on) AS first_date, MAX(purchased_on) AS last_date
-                         FROM fuel_transactions GROUP BY card ORDER BY card''')
+                         FROM fuel_transactions WHERE receipt_id IS NULL GROUP BY card ORDER BY card''')
         drivers = query('SELECT id,name,fuel_card FROM drivers WHERE COALESCE(is_deleted,0)=0 ORDER BY name')
         card_rows = ''
         for row in cards:
             owner = next((d for d in drivers if d['fuel_card'] == row['card']), None)
             card_rows += f"<tr><td>****{esc(row['card'])}</td><td>{esc(owner['name']) if owner else 'Unassigned — set this card on Drivers'}</td><td>{row['n']}</td><td>{row['first_date']} through {row['last_date']}</td></tr>"
         history = query('SELECT * FROM driver_fuel_reports ORDER BY saved_at DESC')
-        reports = ''.join(f"<li><a href='/fuel/reports/{r['id']}'>{'VOIDED — ' if r['voided'] else ''}{esc(r['driver_name'])} — {r['start_date']} through {r['end_date']} — card ****{r['card']}</a></li>" for r in history)
+        reports = ''.join(f"<li><a href='/fuel/reports/{r['id']}'>{'VOIDED — ' if r['voided'] else ''}{esc(r['driver_name'])} — {r['start_date']} through {r['end_date']} — {('card ****'+esc(r['card'])) if r['card'] else 'Receipt purchases'}</a></li>" for r in history)
         notice = ''
         if request.args.get('imported', '').isdigit() and request.args.get('skipped', '').isdigit():
             notice = f"<p role='status'>Imported {int(request.args['imported'])} purchases; skipped {int(request.args['skipped'])} duplicates.</p>"
-        return page(f"""<div class='card'><h1>Fuel Reports</h1>{notice}
+        return page(f"""<div class='card'><h1>Fuel Reports</h1>{notice}<p><a class='btn' href='/fuel/receipts'>Scan / Upload Fuel Receipt</a></p><p>Review and save receipt purchases, then run a fuel report. Earlier unreported purchases carry forward.</p><details><summary>Import previous WEX / Speedway history</summary>
           <p>Export <strong>POSTED</strong> fuel transactions from WEX as CSV, including older dates to catch missed fuel and late-posted purchases.
           Reimporting the same purchases will not duplicate them.</p>
           <p>This import does not connect automatically to WEX. Refresh the export before preparing each driver report.</p>
           <form method='post' action='/fuel/import' enctype='multipart/form-data'>
             <label>Posted WEX transactions CSV<input type='file' name='file' accept='.csv' required></label>
             <label><input style='width:auto;' type='checkbox' name='posted_only' value='yes' required> This file contains posted fuel transactions.</label>
-            <button>Import Fuel Transactions</button></form>
+            <button>Import Fuel Transactions</button></form></details>
           <p><a href='/drivers'>Assign fuel cards to drivers</a> · <a href='/driver-loads'>Run driver and fuel report</a></p>
           <div style='overflow:auto;'><table><tr><th>Card</th><th>Driver</th><th>Purchases imported</th><th>Purchase dates available</th></tr>{card_rows}</table></div>
           <h2>Saved fuel reports</h2><ul>{reports or '<li>No saved reports yet. Record earlier report coverage before preparing your first new report.</li>'}</ul></div>""")
@@ -333,8 +336,8 @@ def register_fuel(app, db, query, query_one, execute, normalize_sql, page, esc, 
             if not ids:
                 raise ValueError('Select at least one fuel purchase.')
             driver = query_one('SELECT * FROM drivers WHERE id=?', (driver_id,))
-            if not driver or not driver['fuel_card']:
-                raise ValueError('Assign the driver a fuel card first.')
+            if not driver:
+                raise ValueError('Select an existing driver first.')
             with closing(db()) as conn:
                 try:
                     existing = run(conn, 'SELECT * FROM driver_fuel_reports WHERE id=?', (report_id,)).fetchone()
@@ -343,14 +346,14 @@ def register_fuel(app, db, query, query_one, execute, normalize_sql, page, esc, 
                         if existing['driver_id'] != driver_id or existing['start_date'] != start or existing['end_date'] != end or ids != existing_ids or existing['kind'] != kind:
                             raise ValueError('This report was already saved with different selections. Refresh the preview.')
                         return redirect('/fuel/reports/' + report_id)
-                    rows = run(conn, '''SELECT f.* FROM fuel_transactions f WHERE f.card=? AND f.purchased_on<=?
-                        AND NOT EXISTS (SELECT 1 FROM driver_fuel_report_items i WHERE i.transaction_id=f.id AND i.active=1)''', (driver['fuel_card'], end)).fetchall()
+                    rows = run(conn, '''SELECT f.* FROM fuel_transactions f WHERE (f.driver_id=? OR (f.driver_id IS NULL AND f.card=? AND f.card!='')) AND f.purchased_on<=?
+                        AND NOT EXISTS (SELECT 1 FROM driver_fuel_report_items i WHERE i.transaction_id=f.id AND i.active=1)''', (driver_id,driver['fuel_card'] or '', end)).fetchall()
                     valid = {r['id'] for r in rows}
                     if not set(ids).issubset(valid):
                         raise ValueError('A selected purchase is already reported, belongs to another card, or is after the end date. Refresh the preview.')
                     run(conn, '''INSERT INTO driver_fuel_reports
                         (id,driver_id,driver_name,card,start_date,end_date,kind,saved_at) VALUES (?,?,?,?,?,?,?,?)''',
-                        (report_id, driver_id, driver['name'] or '', driver['fuel_card'], start, end, kind, datetime.now().isoformat()))
+                        (report_id, driver_id, driver['name'] or '', driver['fuel_card'] or '', start, end, kind, datetime.now().isoformat()))
                     for offset in range(0, len(ids), 100):
                         chunk = ids[offset:offset + 100]
                         values = tuple(value for transaction_id in chunk for value in (report_id, transaction_id))
@@ -387,7 +390,7 @@ def register_fuel(app, db, query, query_one, execute, normalize_sql, page, esc, 
           .fuel-table {{overflow:visible!important;}} .fuel-table table {{font-size:8px;table-layout:fixed;}}
           .fuel-table th,.fuel-table td {{overflow-wrap:anywhere;padding:4px;}} .card {{box-shadow:none;}} }}</style>
           <div class='card'><h1>{'VOIDED — ' if report['voided'] else ''}{'Previous Fuel Report Coverage' if report['kind']=='prior' else 'Saved Driver Fuel Report'}</h1>
-          <h2>{esc(report['driver_name'])} — card ****{esc(report['card'])}</h2>
+          <h2>{esc(report['driver_name'])} — {('card ****'+esc(report['card'])) if report['card'] else 'Receipt purchases'}</h2>
           <p>{report['start_date']} through {report['end_date']} · Saved {esc(report['saved_at'][:10])}</p>
           <p>{len(rows)} purchase(s) · Gallons: {gallons:,.3f} · Total net cost: <strong>${total/100:,.2f}</strong>
           · Includes earlier unreported fuel: <strong>${earlier/100:,.2f}</strong></p>

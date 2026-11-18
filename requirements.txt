@@ -6,3 +6,5 @@ requests
 reportlab
 pypdf
 Pillow
+pillow-heif
+pypdfium2
