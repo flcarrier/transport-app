@@ -345,9 +345,9 @@ def register_receipts(app, db, query, query_one, execute, normalize_sql, page, e
         images=json.loads(receipt['images_json'])
         urls=[f"/fuel/receipts/{receipt['id']}/image/{n}" for n in range(len(images))]
         preview=''.join(f"<a href='{url}' target='_blank' rel='noopener'><img src='{url}' alt='Receipt page {n+1}' style='max-width:100%;max-height:700px;object-fit:contain;'></a>" for n,url in enumerate(urls))
-        notice=f"<p role='alert'>{esc(message)}</p>" if message else ''
+        notice=f"<p role='alert' style='color:#a11;font-weight:bold;'>Receipt not saved. {esc(message)}</p>" if message else ''
         if saved:
-            return page(f"""<div class='card'><h1>Saved Fuel Receipt</h1>{batch_links(receipt['id'])}<p>This receipt is already saved. Uploading it again will not create another charge.</p>
+            return page(f"""<div class='card'><h1>Saved Fuel Receipt</h1><p role='status' style='color:#176b32;font-weight:bold;'>Fuel receipt saved successfully.</p>{batch_links(receipt['id'])}<p>This receipt is already saved. Uploading it again will not create another charge.</p>
               <p>Driver: <strong>{esc(saved['driver_name'])}</strong> · Date: {saved['purchased_on']} · Total: ${saved['cents']/100:,.2f}</p>
               <p><a href='/fuel/receipts'>More receipts</a> · <a href='/fuel'>Fuel Reports</a> · <a href='/fuel/receipts/{receipt['id']}/original'>Download original receipt</a></p>{preview}</div>""")
         duplicate_check=("<label><input type='checkbox' name='allow_duplicate' value='yes' style='width:auto;' required> I checked the possible duplicate and this is a different purchase.</label>" if duplicate else '')
@@ -357,7 +357,8 @@ def register_receipts(app, db, query, query_one, execute, normalize_sql, page, e
           <button type='button' id='stop-reading'>Enter Details Manually</button></p>
           <div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:20px;'>
           <div>{preview}<a href='/fuel/receipts/{receipt['id']}/original'>Download original receipt</a></div>
-          <form id='receipt-review' method='post' action='/fuel/receipts/{receipt['id']}/save'>
+          <form id='receipt-review' method='post' action='/fuel/receipts/{receipt['id']}/save' novalidate>
+            <p id='save-error-top' role='alert' style='color:#a11;font-weight:bold;' hidden></p>
             <label>Driver<select name='driver_id' required>{options}</select></label>
             <p id='card-match'>{esc(fields.get('match_note','Choose the driver manually if the receipt has no recognized card.'))}</p>
             <label>Purchase date<input type='date' name='purchased_on' value='{esc(fields.get('purchased_on',''))}' required></label>
@@ -370,7 +371,9 @@ def register_receipts(app, db, query, query_one, execute, normalize_sql, page, e
             <p>Confirm that the amount and gallons are fuel only. Remove any store purchases from the amount.</p>
             {duplicate_check}
             <label><input style='width:auto;' type='checkbox' name='confirmed' value='yes' required> I reviewed the receipt, driver, date, gallons and fuel amount.</label>
-            <button id='save-receipt'>Confirm and Save Fuel Receipt</button>
+            {notice}<p id='save-error' role='alert' style='color:#a11;font-weight:bold;' hidden></p>
+            <p id='save-status' role='status' aria-live='polite'>Check the review box, then press Confirm and Save Fuel Receipt. Review Next Receipt does not save this receipt.</p>
+            <button type='submit' id='save-receipt'>Confirm and Save Fuel Receipt</button>
             <a href='/fuel/receipts'>Back to receipts</a>
           </form></div><form method='post' action='/fuel/receipts/{receipt['id']}/discard'><button>Discard Receipt Draft</button></form></div>
           <script>
@@ -378,6 +381,28 @@ def register_receipts(app, db, query, query_one, execute, normalize_sql, page, e
             const form=document.getElementById('receipt-review'),status=document.getElementById('ocr-status');
             const read=document.getElementById('read-receipt'),save=document.getElementById('save-receipt');
             const urls={json.dumps(urls)}; let worker=null,cancelled=false,busy=false;
+            const saveStatus=document.getElementById('save-status');
+            const saveErrors=[document.getElementById('save-error'),document.getElementById('save-error-top')];
+            const labels={{driver_id:'Driver',purchased_on:'Purchase date',merchant:'Fuel station',gallons:'Gallons',total:'Fuel total paid',card:'Card last 4 or 5 digits',confirmed:'Review confirmation',allow_duplicate:'Duplicate confirmation'}};
+            form.addEventListener('submit',event=>{{
+              const invalid=Array.from(form.elements).filter(el=>el.willValidate&&!el.validity.valid);
+              if(invalid.length){{
+                event.preventDefault();
+                const messages=invalid.map(el=>el.name==='driver_id'?'Choose a driver.':
+                  el.name==='confirmed'?'Check the receipt review box.':
+                  el.name==='allow_duplicate'?'Confirm that this is a different purchase.':
+                  (labels[el.name]||el.name)+': '+el.validationMessage);
+                const text='Receipt not saved. '+messages.join(' ');
+                saveErrors.forEach(el=>{{el.hidden=false;el.textContent=text;}});
+                saveStatus.textContent='Correct the fields listed above, then press Confirm and Save again.';
+                invalid[0].focus();invalid[0].scrollIntoView({{block:'center',behavior:'smooth'}});
+                return;
+              }}
+              saveErrors.forEach(el=>el.hidden=true);
+              saveStatus.textContent='Saving your receipt. Please wait for the saved confirmation.';
+              save.disabled=true;save.textContent='Saving Receipt…';
+            }});
+            window.addEventListener('pageshow',()=>{{save.disabled=false;save.textContent='Confirm and Save Fuel Receipt';}});
             form.querySelectorAll('input,select').forEach(el=>el.addEventListener('input',()=>el.dataset.edited='yes'));
             document.getElementById('stop-reading').addEventListener('click',()=>{{
               cancelled=true; if(worker) worker.terminate().catch(()=>{{}});
@@ -443,7 +468,10 @@ def register_receipts(app, db, query, query_one, execute, normalize_sql, page, e
         try:
             if request.form.get('confirmed')!='yes':
                 raise ValueError('Confirm the receipt details and driver before saving.')
-            driver_id=int(request.form.get('driver_id',''))
+            raw_driver=request.form.get('driver_id','').strip()
+            if not raw_driver.isdigit():
+                raise ValueError('Choose a driver before saving the receipt.')
+            driver_id=int(raw_driver)
             driver=query_one('SELECT id,name FROM drivers WHERE id=? AND COALESCE(is_deleted,0)=0',(driver_id,))
             if not driver:
                 raise ValueError('Choose an active driver.')
