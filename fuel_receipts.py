@@ -490,8 +490,8 @@ def register_receipts(app, db, query, query_one, execute, normalize_sql, page, e
             cents=int(total*100)
             duplicates=query('''SELECT f.id FROM fuel_transactions f
                 WHERE f.purchased_on=? AND f.cents=? AND (f.driver_id=? OR
-                (f.driver_id IS NULL AND ?!='' AND f.card!='' AND (? LIKE '%' || f.card OR f.card LIKE '%' || ?)))''',
-                (purchased_on,cents,driver_id,card,card,card))
+                (f.driver_id IS NULL AND ?!='' AND f.card!='' AND (? LIKE (? || f.card) OR f.card LIKE ?)))''',
+                (purchased_on,cents,driver_id,card,card,'%', '%'+card))
             if duplicates and request.form.get('allow_duplicate')!='yes':
                 return review(receipt,request.form,'Possible duplicate: a fuel purchase for this driver or card already has this date and amount. Check it before saving another charge.',True),409
             transaction_id='receipt-'+receipt['digest']
