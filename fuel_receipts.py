@@ -108,6 +108,30 @@ def receipt_images(data):
     return images, mime
 
 
+def split_receipt_pdf(data):
+    """One receipt per PDF page; validate the whole upload before storing drafts."""
+    from pypdf import PdfReader, PdfWriter
+    reader = PdfReader(BytesIO(data))
+    if reader.is_encrypted:
+        raise ValueError('Upload an unlocked PDF without a password.')
+    if not 1 <= len(reader.pages) <= 20:
+        raise ValueError('Upload a PDF with 1 to 20 pages, one receipt per page.')
+    parts = []
+    size = 0
+    for source in reader.pages:
+        writer = PdfWriter()
+        writer.add_page(source)
+        output = BytesIO()
+        writer.write(output)
+        part = output.getvalue()
+        images, mime = receipt_images(part)
+        size += len(part) + sum(len(image) for image in images)
+        if size > 48 * 1024 * 1024:
+            raise ValueError('This PDF is too complex to split at once. Upload fewer pages per file.')
+        parts.append((part, images, mime))
+    return parts
+
+
 def register_receipts(app, db, query, query_one, execute, normalize_sql, page, esc, postgres):
     for column, sql_type in [('driver_id','INTEGER'),('receipt_id','TEXT')]:
         if postgres:
@@ -124,6 +148,11 @@ def register_receipts(app, db, query, query_one, execute, normalize_sql, page, e
         execute('ALTER TABLE fuel_receipts ADD COLUMN IF NOT EXISTS is_discarded INTEGER NOT NULL DEFAULT 0')
     elif 'is_discarded' not in {r['name'] for r in query('PRAGMA table_info(fuel_receipts)')}:
         execute('ALTER TABLE fuel_receipts ADD COLUMN is_discarded INTEGER NOT NULL DEFAULT 0')
+    execute('''CREATE TABLE IF NOT EXISTS fuel_receipt_batches (
+        id TEXT PRIMARY KEY, original_name TEXT NOT NULL, uploaded_at TEXT NOT NULL)''')
+    execute('''CREATE TABLE IF NOT EXISTS fuel_receipt_batch_pages (
+        batch_id TEXT NOT NULL, page_no INTEGER NOT NULL, receipt_id TEXT NOT NULL,
+        PRIMARY KEY(batch_id,page_no))''')
     # Preserve the user's existing card assignments when moving to receipt entry.
     execute('''UPDATE fuel_transactions SET driver_id=(SELECT d.id FROM drivers d
                WHERE d.fuel_card=fuel_transactions.card AND COALESCE(d.is_deleted,0)=0)
@@ -145,6 +174,67 @@ def register_receipts(app, db, query, query_one, execute, normalize_sql, page, e
                     if r['fuel_card'] and (str(r['fuel_card']).endswith(card) or card.endswith(str(r['fuel_card'])))]
         return candidates[0] if len(candidates)==1 else None
 
+    def batch_rows(batch_id):
+        return query('''SELECT b.page_no,r.* FROM fuel_receipt_batch_pages b
+                        JOIN fuel_receipts r ON r.id=b.receipt_id WHERE b.batch_id=? ORDER BY b.page_no''',(batch_id,))
+
+    def batch_links(receipt_id):
+        source = query_one('SELECT batch_id,page_no FROM fuel_receipt_batch_pages WHERE receipt_id=? ORDER BY batch_id LIMIT 1',(receipt_id,))
+        if not source:
+            return ''
+        rows = batch_rows(source['batch_id'])
+        following = next((r for r in rows if r['page_no']>source['page_no'] and r['id']!=receipt_id and not r['transaction_id'] and not r['is_discarded']),None)
+        next_link = f" · <a href='/fuel/receipts/{following['id']}'>Review Next Receipt</a>" if following else ''
+        return f"<p>PDF page {source['page_no']} of {len(rows)} · <a href='/fuel/receipt-batches/{source['batch_id']}'>All Receipts in This PDF</a>{next_link}</p>"
+
+    @app.route('/fuel/receipt-batches/<batch_id>')
+    def receipt_batch(batch_id):
+        batch = query_one('SELECT * FROM fuel_receipt_batches WHERE id=?',(batch_id,))
+        if not batch:
+            return fail('Receipt PDF not found.',404)
+        rows = batch_rows(batch_id)
+        saved = sum(bool(r['transaction_id']) for r in rows)
+        items = ''.join(f"<tr><td>{r['page_no']}</td><td><a href='/fuel/receipts/{r['id']}'>{esc(r['original_name'])}</a></td><td>{'Saved' if r['transaction_id'] else ('Discarded draft' if r['is_discarded'] else 'Review needed')}</td></tr>" for r in rows)
+        pending = next((r for r in rows if not r['transaction_id'] and not r['is_discarded']),None)
+        start = f"<p><a href='/fuel/receipts/{pending['id']}'>Review Next Receipt</a></p>" if pending else ''
+        return page(f"""<div class='card'><h1>Receipts From PDF</h1><p>{esc(batch['original_name'])}</p>
+          <p>{len(rows)} separate receipt(s) · {saved} saved to fuel.</p>
+          <p>Each page is a separate receipt. Review each driver's assignment, date, gallons and fuel amount before saving. Uploading alone does not add fuel charges.</p>
+          {start}<div style='overflow:auto;'><table><tr><th>PDF page</th><th>Receipt</th><th>Status</th></tr>{items}</table></div>
+          <p><a href='/fuel/receipts'>Upload More Receipts</a></p></div>""")
+
+    def upload_pdf(data, filename):
+        batch_id = hashlib.sha256(data).hexdigest()
+        if query_one('SELECT id FROM fuel_receipt_batches WHERE id=?',(batch_id,)):
+            return redirect('/fuel/receipt-batches/'+batch_id)
+        try:
+            parts = split_receipt_pdf(data)
+        except Exception as exc:
+            app.logger.warning('Receipt PDF could not be split: %s',type(exc).__name__)
+            return fail(str(exc) if isinstance(exc,ValueError) else 'This PDF could not be split. Try an unlocked PDF or upload receipt photos.')
+        with closing(db()) as conn:
+            try:
+                run(conn,'''INSERT INTO fuel_receipt_batches(id,original_name,uploaded_at) VALUES (?,?,?)
+                            ON CONFLICT(id) DO NOTHING''',(batch_id,filename[:200],datetime.now().isoformat()))
+                for number,(part,images,mime) in enumerate(parts,1):
+                    digest = hashlib.sha256(part).hexdigest()
+                    receipt_id = uuid.uuid4().hex
+                    stem = filename.rsplit('.',1)[0][:160]
+                    run(conn,'''INSERT INTO fuel_receipts
+                        (id,digest,original_name,original_base64,mime,images_json,suggestions_json,uploaded_at)
+                        VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(digest) DO NOTHING''',
+                        (receipt_id,digest,f'{stem} - page {number}.pdf',base64.b64encode(part).decode('ascii'),mime,
+                         json.dumps(images),'{}',datetime.now().isoformat()))
+                    actual = run(conn,'SELECT id FROM fuel_receipts WHERE digest=?',(digest,)).fetchone()
+                    run(conn,'''INSERT INTO fuel_receipt_batch_pages(batch_id,page_no,receipt_id) VALUES (?,?,?)
+                                ON CONFLICT(batch_id,page_no) DO NOTHING''',(batch_id,number,actual['id']))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                app.logger.exception('Could not save split receipt PDF')
+                return fail('No partial upload was saved. Please try uploading this PDF again.',409)
+        return redirect('/fuel/receipt-batches/'+batch_id)
+
     @app.route('/fuel/receipts')
     def receipt_home():
         rows=query('''SELECT r.id,r.original_name,r.uploaded_at,r.transaction_id,f.purchased_on,f.cents,d.name AS driver_name
@@ -157,7 +247,8 @@ def register_receipts(app, db, query, query_one, execute, normalize_sql, page, e
                       f"<td>{('$'+format(r['cents']/100,',.2f')) if r['cents'] is not None else ''}</td>"
                       f"<td>{'Saved' if r['transaction_id'] else 'Not saved to fuel yet'}</td></tr>" for r in rows)
         return page(f"""<div class='card'><h1>Scan / Upload Fuel Receipt</h1>
-          <p>Upload one receipt at a time. Review the date, station, gallons, amount and driver before saving.</p>
+          <p>Upload a receipt photo or a PDF with one receipt per page. Each PDF page becomes a separate receipt to review.</p>
+          <p>PDFs: up to 20 pages and 12 MB. Confirm the date, station, gallons, amount and driver for each receipt before saving.</p>
           <form method='post' action='/fuel/receipts/upload' enctype='multipart/form-data'>
             <label>Choose a receipt photo or PDF<input type='file' name='file' accept='image/*,.heic,.heif,.pdf' required></label>
             <button>Upload and Review Receipt</button></form>
@@ -177,6 +268,8 @@ def register_receipts(app, db, query, query_one, execute, normalize_sql, page, e
         data=uploaded.read(12*1024*1024+1)
         if not data or len(data)>12*1024*1024:
             return fail('Choose a non-empty receipt smaller than 12 MB.')
+        if data.startswith(b'%PDF-'):
+            return upload_pdf(data,uploaded.filename)
         digest=hashlib.sha256(data).hexdigest()
         existing=query_one('SELECT id FROM fuel_receipts WHERE digest=?',(digest,))
         if existing:
@@ -254,11 +347,11 @@ def register_receipts(app, db, query, query_one, execute, normalize_sql, page, e
         preview=''.join(f"<a href='{url}' target='_blank' rel='noopener'><img src='{url}' alt='Receipt page {n+1}' style='max-width:100%;max-height:700px;object-fit:contain;'></a>" for n,url in enumerate(urls))
         notice=f"<p role='alert'>{esc(message)}</p>" if message else ''
         if saved:
-            return page(f"""<div class='card'><h1>Saved Fuel Receipt</h1><p>This receipt is already saved. Uploading it again will not create another charge.</p>
+            return page(f"""<div class='card'><h1>Saved Fuel Receipt</h1>{batch_links(receipt['id'])}<p>This receipt is already saved. Uploading it again will not create another charge.</p>
               <p>Driver: <strong>{esc(saved['driver_name'])}</strong> · Date: {saved['purchased_on']} · Total: ${saved['cents']/100:,.2f}</p>
               <p><a href='/fuel/receipts'>More receipts</a> · <a href='/fuel'>Fuel Reports</a> · <a href='/fuel/receipts/{receipt['id']}/original'>Download original receipt</a></p>{preview}</div>""")
         duplicate_check=("<label><input type='checkbox' name='allow_duplicate' value='yes' style='width:auto;' required> I checked the possible duplicate and this is a different purchase.</label>" if duplicate else '')
-        return page(f"""<div class='card'><h1>Review Fuel Receipt</h1>{notice}
+        return page(f"""<div class='card'><h1>Review Fuel Receipt</h1>{batch_links(receipt['id'])}{notice}
           <p id='ocr-status' role='status'>Nothing has been added to fuel yet. Read the receipt or use automatic reading, then confirm the details.</p>
           <p><button type='button' id='read-receipt'>Read Receipt Automatically</button>
           <button type='button' id='stop-reading'>Enter Details Manually</button></p>
