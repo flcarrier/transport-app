@@ -165,34 +165,39 @@ def register_statements(app, query, query_one, execute, page, esc, postgres, tri
             return error(str(exc))
         return redirect('/driver-loads?'+urlencode(dict(driver_id=driver['id'],start=start,end=end,miles_saved='yes')))
 
+    def statement_data():
+        driver,start,end,loads=report_context()
+        driver_id=driver['id']
+        rate=amount(driver['pay_rate_per_mile'],optional=True,nonnegative=True)
+        if rate is not None and rate != rate.quantize(Decimal('.0001')):
+            raise ValueError('Enter a pay rate with no more than four decimal places.')
+        if request.method=='POST':
+            save_report_miles(driver,loads,persist=False)
+        trips=[dict(load_no=r['load_no'],date=r['delivery_date'] or r['pickup_date'],
+                    route=' - '.join(filter(None,[r['origin'],r['optional_stop_1'],r['optional_stop_2'],r['destination']])),
+                    loaded_miles=trip_miles(r),empty_miles=r['empty_miles']) for r in loads]
+        adjustments=[]
+        adjustment=amount(request.values.get('adjustment_amount'),optional=True,nonnegative=True)
+        if adjustment is not None:
+            description=request.values.get('adjustment_description','').strip()
+            kind=request.values.get('adjustment_type')
+            if not description or kind not in ('credit','deduction') or adjustment!=adjustment.quantize(Decimal('.01')):
+                raise ValueError('Enter a description, type, and amount with up to two decimal places for the adjustment.')
+            adjustments.append(dict(description=description,date=end,amount=adjustment if kind=='credit' else -adjustment))
+        info=dict(company_name='Florida Carrier & Brokerage Service Inc',
+                  company_address=request.values.get('company_address','').strip(),remit_to=request.values.get('remit_to','').strip(),
+                  driver_name=driver['name'],payee_name=driver['payee_name'],address=driver['mailing_address'],
+                  statement_no=request.values.get('statement_no','').strip() or f'DR-{driver_id}-{start.replace("-","")}-{end.replace("-","")}',
+                  statement_date=datetime.now().strftime('%m/%d/%Y'),start=start,end=end,pay_rate=rate,
+                  trucks=', '.join(sorted({r['truck_unit'] for r in loads if r['truck_unit']})),
+                  notes='')
+        return driver,start,end,loads,info,trips,adjustments
+
     @app.route('/driver-loads/pdf',methods=['GET','POST'])
     def driver_statement_pdf():
         try:
-            driver,start,end,loads=report_context()
+            driver,start,end,loads,info,trips,adjustments=statement_data()
             driver_id=driver['id']
-            rate=amount(driver['pay_rate_per_mile'],optional=True,nonnegative=True)
-            if rate is not None and rate != rate.quantize(Decimal('.0001')):
-                raise ValueError('Enter a pay rate with no more than four decimal places.')
-            if request.method=='POST':
-                save_report_miles(driver,loads,persist=False)
-            trips=[dict(load_no=r['load_no'],date=r['delivery_date'] or r['pickup_date'],
-                        route=' - '.join(filter(None,[r['origin'],r['optional_stop_1'],r['optional_stop_2'],r['destination']])),
-                        loaded_miles=trip_miles(r),empty_miles=r['empty_miles']) for r in loads]
-            adjustments=[]
-            adjustment=amount(request.values.get('adjustment_amount'),optional=True,nonnegative=True)
-            if adjustment is not None:
-                description=request.values.get('adjustment_description','').strip()
-                kind=request.values.get('adjustment_type')
-                if not description or kind not in ('credit','deduction') or adjustment!=adjustment.quantize(Decimal('.01')):
-                    raise ValueError('Enter a description, type, and amount with up to two decimal places for the adjustment.')
-                adjustments.append(dict(description=description,date=end,amount=adjustment if kind=='credit' else -adjustment))
-            info=dict(company_name='Florida Carrier & Brokerage Service Inc',
-                      company_address=request.values.get('company_address','').strip(),remit_to=request.values.get('remit_to','').strip(),
-                      driver_name=driver['name'],payee_name=driver['payee_name'],address=driver['mailing_address'],
-                      statement_no=request.values.get('statement_no','').strip() or f'DR-{driver_id}-{start.replace("-","")}-{end.replace("-","")}',
-                      statement_date=datetime.now().strftime('%m/%d/%Y'),start=start,end=end,pay_rate=rate,
-                      trucks=', '.join(sorted({r['truck_unit'] for r in loads if r['truck_unit']})),
-                      notes='')
             result=render_statement(info,trips,adjustments)
             if request.method=='POST':
                 save_report_miles(driver,loads)
@@ -201,14 +206,14 @@ def register_statements(app, query, query_one, execute, page, esc, postgres, tri
         return send_file(BytesIO(result),mimetype='application/pdf',as_attachment=True,
                          download_name=f'driver_{driver_id}_statement_{start}_to_{end}.pdf')
 
-    return fields,controls
+    return fields,controls,statement_data,save_report_miles
 
 
 def render_statement(info, trips, adjustments):
     result = calculate(trips, info.get('pay_rate'), adjustments)
     stream = BytesIO()
     doc = SimpleDocTemplate(stream, pagesize=letter, rightMargin=30, leftMargin=30,
-                            topMargin=28, bottomMargin=40, title='Driver Statement',
+                            topMargin=28, bottomMargin=40, title=info.get('report_title','Driver Statement'),
                             author=info['company_name'])
     styles = {
         'normal': ParagraphStyle('normal', fontName='Helvetica', fontSize=8, leading=10),
@@ -246,7 +251,7 @@ def render_statement(info, trips, adjustments):
     statement = f"Statement #{info['statement_no']}\n{info['driver_name']}\nDate: {info['statement_date']}\nTruck(s): {info.get('trucks') or 'Not assigned'}"
     header = Table([[company, p(statement, 'right')]], colWidths=[290,262])
     header.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),0),('RIGHTPADDING',(0,0),(-1,-1),0)]))
-    story = [header, Spacer(1,32),
+    story = ([p(info['report_title'], 'header'),Spacer(1,12)] if info.get('report_title') else []) + [header, Spacer(1,32),
              p(info.get('payee_name') or info['driver_name'], 'header')]
     if info.get('address'):
         story.append(p(info['address']))
@@ -286,6 +291,37 @@ def render_statement(info, trips, adjustments):
     story += [Spacer(1,10),p('Report preview. Downloading this PDF does not finalize a payment.', 'small')]
     if info.get('notes'):
         story += [Spacer(1,12),p(info['notes'],'small')]
+
+    company=info.get('company_report')
+    if company is not None:
+        story += [Spacer(1,16),p('Company Totals','header'),Spacer(1,6)]
+        summary=[['Total confirmation amounts',money(company['confirmation_total'])],
+                 ['Driver mileage pay',money(result['pay'])],
+                 ['Credits / deductions',money(result['adjustments'])],
+                 ['Driver check amount',money(result['check'])],
+                 ['Fuel gallons (purchased)',f"{company['gallons']:,.3f}"],
+                 ['Total fuel cost',money(company['fuel_cost'])]]
+        story += [grid([[p(label),p(value)] for label,value in summary],[382,170],header=False),Spacer(1,8),
+                  p('Confirmation amounts are the saved load rates, not confirmation of broker payment. Fuel is shown separately and does not reduce the driver check amount.','small'),
+                  p(f"Fuel totals include earlier unreported purchases: {company['earlier_gallons']:,.3f} gallons / {money(company['earlier_cost'])}.",'small'),Spacer(1,12),
+                  p('Load Confirmation Amounts','header')]
+        confirmations=[[p('Date','small'),p('Internal load #','small'),p('Confirmation amount','small')]]
+        for row in company['confirmations']:
+            confirmations.append([p(row['date'],'small'),p(row['load_no'],'small'),p(money(row['amount']),'small')])
+        confirmations.append([p('Total','small'),'',p(money(company['confirmation_total']),'small')])
+        story += [grid(confirmations,[80,352,120]),Spacer(1,12),p('Fuel Purchases','header'),
+                  p('Gallons and costs are purchases from saved receipts/imports. Within-date purchases are shown even when already reported; older purchases appear only when no prior fuel report covers them.','small')]
+        purchases=[[p(label,'small') for label in ['Purchase date','Transaction','Station / location','Gallons','Fuel cost','Coverage']]]
+        for row in company['fuel']:
+            purchases.append([p(row['purchased_on'],'small'),p(row['transaction_no'],'small'),
+                              p(' / '.join(filter(None,[row['merchant'],row['location']])),'small'),
+                              p(row['gallons'],'small'),p(money(Decimal(row['cents'])/100),'small'),
+                              p('Earlier unreported fuel' if row['purchased_on']<info['start'] else 'Within date range','small')])
+        if not company['fuel']:
+            purchases.append([p('No matching fuel purchases found.','small')]+['']*5)
+        purchases.append([p('Total','small'),'','',p(f"{company['gallons']:,.3f}",'small'),p(money(company['fuel_cost']),'small'),''])
+        story += [grid(purchases,[64,80,190,56,66,96]),Spacer(1,8),
+                  p('Downloading this company report does not mark fuel reported. Record coverage in Fuel Reports after review.','small')]
 
     def footer(c, doc):
         c.setFont('Helvetica',6)

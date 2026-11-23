@@ -164,6 +164,7 @@ BASE_HTML = """
     <a href="/invoices">Invoices</a>
     <a href="/invoice-archive">Invoice Archive</a>
     <a href="/driver-loads">Driver Load Report</a>
+    <a href="/company-report">Company Report</a>
     <a href="/fuel">Fuel Reports</a>
   </div>
   <hr>
@@ -3314,8 +3315,10 @@ fuel_driver_fields, fuel_report_section = register_fuel(
 from fuel_receipts import register_receipts
 register_receipts(app, db, query, query_one, execute, normalize_sql, page, html_attr, USE_POSTGRES)
 from driver_statement import register_statements
-statement_driver_fields, statement_report_controls = register_statements(
+statement_driver_fields, statement_report_controls, statement_data, save_statement_miles = register_statements(
     app, query, query_one, execute, page, html_attr, USE_POSTGRES, driver_trip_total_miles)
+from company_report import register_company_report
+register_company_report(app, query, query_one, page, html_attr, statement_report_controls, statement_data, save_statement_miles)
 app.logger.warning("Database initialized: %s", "PostgreSQL" if USE_POSTGRES else "local SQLite")
 
 
