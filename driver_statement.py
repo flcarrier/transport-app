@@ -218,7 +218,7 @@ def render_statement(info, trips, adjustments):
     styles = {
         'normal': ParagraphStyle('normal', fontName='Helvetica', fontSize=8, leading=10),
         'small': ParagraphStyle('small', fontName='Helvetica', fontSize=7, leading=9),
-        'header': ParagraphStyle('header', fontName='Helvetica-Bold', fontSize=10, leading=13),
+        'header': ParagraphStyle('header', fontName='Helvetica-Bold', fontSize=10, leading=13, keepWithNext=True),
         'right': ParagraphStyle('right', fontName='Helvetica', fontSize=9, leading=12, alignment=TA_RIGHT),
         'warning': ParagraphStyle('warning', fontName='Helvetica-Bold', fontSize=8, leading=11, textColor=colors.HexColor('#8b260d')),
     }
@@ -300,9 +300,12 @@ def render_statement(info, trips, adjustments):
                  ['Credits / deductions',money(result['adjustments'])],
                  ['Driver check amount',money(result['check'])],
                  ['Fuel gallons (purchased)',f"{company['gallons']:,.3f}"],
-                 ['Total fuel cost',money(company['fuel_cost'])]]
+                 ['Total fuel cost',money(company['fuel_cost'])],
+                 ['Total costs (driver check + fuel)',money(company['total_costs'])],
+                 ['Company balance after costs',money(company['balance'])]]
         story += [grid([[p(label),p(value)] for label,value in summary],[382,170],header=False),Spacer(1,8),
                   p('Confirmation amounts are the saved load rates, not confirmation of broker payment. Fuel is shown separately and does not reduce the driver check amount.','small'),
+                  p('Company balance = confirmation amounts minus driver check amount minus fuel cost. Driver credits/deductions are already included in the check. Other company expenses are not recorded here.','small'),
                   p(f"Fuel totals include earlier unreported purchases: {company['earlier_gallons']:,.3f} gallons / {money(company['earlier_cost'])}.",'small'),Spacer(1,12),
                   p('Load Confirmation Amounts','header')]
         confirmations=[[p('Date','small'),p('Internal load #','small'),p('Confirmation amount','small')]]

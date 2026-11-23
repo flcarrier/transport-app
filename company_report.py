@@ -35,6 +35,9 @@ def register_company_report(app,query,query_one,page,esc,controls,statement_data
                 (SELECT 1 FROM driver_fuel_report_items i WHERE i.transaction_id=f.id AND i.active=1))
             ORDER BY f.purchased_on,f.transaction_no,f.id''',(driver['id'],driver['fuel_card'] or '',end,start))]
         company=company_totals(loads,fuel,start)
+        pay=calculate(trips,info['pay_rate'],adjustments)
+        company['total_costs']=(pay['check']+company['fuel_cost']) if pay['check'] is not None else None
+        company['balance']=(company['confirmation_total']-company['total_costs']) if company['confirmation_total'] is not None and company['total_costs'] is not None else None
         info['report_title']='Company Report'
         info['company_report']=company
         if not request.values.get('statement_no','').strip():
@@ -60,7 +63,9 @@ def register_company_report(app,query,query_one,page,esc,controls,statement_data
             summary=[('Total confirmation amounts',money(company['confirmation_total'])),
                      ('Driver mileage pay',money(pay['pay'])),('Credits / deductions',money(pay['adjustments'])),
                      ('Driver check amount',money(pay['check'])),('Fuel gallons (purchased)',f"{company['gallons']:,.3f}"),
-                     ('Total fuel cost',money(company['fuel_cost']))]
+                     ('Total fuel cost',money(company['fuel_cost'])),
+                     ('Total costs (driver check + fuel)',money(company['total_costs'])),
+                     ('Company balance after costs',money(company['balance']))]
             totals=''.join(f'<tr><th>{label}</th><td>{value}</td></tr>' for label,value in summary)
             miles=''
             for load,trip in zip(loads,pay['items']):
@@ -83,6 +88,7 @@ def register_company_report(app,query,query_one,page,esc,controls,statement_data
               <table>{totals}</table><p>Confirmation amounts use each load's saved rate; they do not indicate whether the broker has paid.</p>
               <p>Fuel totals include {money(company['earlier_cost'])} and {company['earlier_gallons']:,.3f} gallons of earlier unreported fuel.
               Fuel is shown separately and does not reduce the driver check amount.</p>
+              <p>Company balance = total confirmation amounts − driver check amount − total fuel cost. The driver check already includes credits and deductions, so those adjustments are not counted twice. Other company expenses are not recorded in this report.</p>
               <h2>Paid Miles for This Report</h2><div style='overflow:auto;'><table><tr><th>Trip #</th><th>Date</th><th>Route</th><th>Loaded miles</th><th>Empty miles</th><th>Total miles</th><th>Driver pay</th></tr>{miles or '<tr><td colspan="7">No trips in the selected date range.</td></tr>'}</table></div>
               <h2>Trip Details / Confirmation Amounts</h2><div style='overflow:auto;'><table><tr><th>Load #</th><th>Customer</th><th>Origin</th><th>Origin ZIP</th><th>Stop 1</th><th>Stop 1 ZIP</th><th>Stop 2</th><th>Stop 2 ZIP</th><th>Destination</th><th>Destination ZIP</th><th>Confirmation amount</th><th>Status</th></tr>{detail}</table></div>
               <h2>Fuel Purchases</h2><p>Gallons and costs come from saved receipts/imports. Within-date purchases are shown even if already included in a fuel report. Older purchases are included only when no prior report covers them.</p>
