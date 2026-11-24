@@ -1559,6 +1559,15 @@ def next_internal_load_number():
     return ""
 
 
+def parse_owner_operator_amount(value):
+    from driver_statement import amount
+    from decimal import Decimal
+    payout=amount(value,optional=True,nonnegative=True)
+    if payout is not None and payout!=payout.quantize(Decimal('.01')):
+        raise ValueError('Enter the owner operator amount with no more than two decimal places.')
+    return str(payout.quantize(Decimal('.01'))) if payout is not None else None
+
+
 @app.route("/loads", methods=["GET", "POST"])
 
 def loads():
@@ -1566,6 +1575,7 @@ def loads():
         try:
             loaded_miles = mileage_input(request.form.get("loaded_miles"))
             empty_miles = mileage_input(request.form.get("empty_miles"))
+            owner_operator_amount = parse_owner_operator_amount(request.form.get("owner_operator_amount"))
         except ValueError as exc:
             return page(f"<p>{html_attr(str(exc))}</p><a href='/loads'>Back to Loads</a>"), 400
         execute(
@@ -1574,9 +1584,9 @@ def loads():
                 load_no, broker_load_no, trailer_id, optional_stop_1, optional_stop_1_zip, optional_stop_2, optional_stop_2_zip,
                 pickup_location_name, pickup_address, origin, origin_zip,
                 delivery_location_name, delivery_address, destination, destination_zip,
-                pickup_date, pickup_time, delivery_date, delivery_time, rate, status, driver_id, truck_id, customer_id, loaded_miles, empty_miles
+                pickup_date, pickup_time, delivery_date, delivery_time, rate, status, driver_id, truck_id, customer_id, loaded_miles, empty_miles, owner_operator_amount
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 request.form.get("load_no"),
@@ -1603,7 +1613,7 @@ def loads():
                 request.form.get("driver_id") or None,
                 request.form.get("truck_id") or None,
                 request.form.get("customer_id") or None,
-                loaded_miles, empty_miles,
+                loaded_miles, empty_miles, owner_operator_amount,
             ),
         )
         return redirect("/loads")
@@ -1687,6 +1697,7 @@ def loads():
           <td>{l['delivery_date'] or ''}</td>
           <td>{l['delivery_time'] or ''}</td>
           <td>${float(l['rate'] or 0):,.2f}</td>
+          <td>{('$'+format(float(l['owner_operator_amount']),',.2f')) if l['owner_operator_amount'] is not None else 'Not set'}</td>
           <td>{l['optional_stop_1'] or ''}</td>
           <td>{l['optional_stop_1_zip'] or ''}</td>
           <td>{l['optional_stop_2'] or ''}</td>
@@ -1724,7 +1735,7 @@ def loads():
         """
 
     if not tr:
-        tr = "<tr><td colspan='28'>No loads yet.</td></tr>"
+        tr = "<tr><td colspan='29'>No loads yet.</td></tr>"
 
     return page(f"""
     {deleted_records_panel('loads')}
@@ -1759,6 +1770,7 @@ def loads():
             <input name='optional_stop_2' placeholder='Optional Stop 2'>
             <input name='optional_stop_2_zip' placeholder='Optional Stop 2 ZIP'>
             <input name='rate' placeholder='Rate'>
+            <label>Owner Operator Amount ($)<input name='owner_operator_amount' type='number' min='0' max='100000000' step='0.01' placeholder='Agreed payout for this load (optional)'></label>
             <label>Paid empty miles<input type='number' min='0' step='0.01' name='empty_miles'></label>
             <select name='status'>
               {''.join(f"<option value='{s}'>{s}</option>" for s in LOAD_STATUSES)}
@@ -1794,6 +1806,7 @@ def loads():
               <th>Delivery Date</th>
               <th>Delivery Time</th>
               <th>Rate</th>
+              <th>Owner Operator Amount</th>
               <th>Optional Stop 1</th>
               <th>Stop 1 ZIP</th>
               <th>Optional Stop 2</th>
@@ -1831,6 +1844,7 @@ def loads():
               <th><input class='load-filter' data-col='21' placeholder='Search'></th>
               <th><input class='load-filter' data-col='22' placeholder='Search'></th>
               <th><input class='load-filter' data-col='23' placeholder='Search'></th>
+              <th><input class='load-filter' data-col='24' placeholder='Search'></th>
               <th></th>
               <th></th>
               <th></th>
@@ -1932,6 +1946,7 @@ def edit_load(load_id):
         try:
             loaded_miles = mileage_input(request.form.get("loaded_miles", load["loaded_miles"]))
             empty_miles = mileage_input(request.form.get("empty_miles", load["empty_miles"]))
+            owner_operator_amount = parse_owner_operator_amount(request.form.get("owner_operator_amount", load["owner_operator_amount"]))
         except ValueError as exc:
             return page(f"<p>{html_attr(str(exc))}</p><a href='/loads'>Back to Loads</a>"), 400
         execute(
@@ -1941,7 +1956,7 @@ def edit_load(load_id):
                 pickup_location_name = ?, pickup_address = ?, origin = ?, origin_zip = ?,
                 delivery_location_name = ?, delivery_address = ?, destination = ?, destination_zip = ?,
                 pickup_date = ?, pickup_time = ?, delivery_date = ?, delivery_time = ?, rate = ?, status = ?,
-                driver_id = ?, truck_id = ?, trailer_id = ?, customer_id = ?, loaded_miles = ?, empty_miles = ?
+                driver_id = ?, truck_id = ?, trailer_id = ?, customer_id = ?, loaded_miles = ?, empty_miles = ?, owner_operator_amount = ?
             WHERE id = ?
             """,
             (
@@ -1970,7 +1985,7 @@ def edit_load(load_id):
                 request.form.get("truck_id") or None,
                 request.form.get("trailer_id") or None,
                 request.form.get("customer_id") or None,
-                loaded_miles, empty_miles,
+                loaded_miles, empty_miles, owner_operator_amount,
                 load_id,
             ),
         )
@@ -2030,6 +2045,7 @@ def edit_load(load_id):
           <input name='optional_stop_2_zip' placeholder='Optional Stop 2 ZIP' value='{html_attr(load['optional_stop_2_zip'])}'>
 
           <input name='rate' placeholder='Rate' value='{load['rate'] or ''}'>
+          <label>Owner Operator Amount ($)<input name='owner_operator_amount' type='number' min='0' max='100000000' step='0.01' value='{html_attr(load["owner_operator_amount"])}' placeholder='Agreed payout for this load (optional)'></label>
           <label>Paid empty miles<input type='number' min='0' step='0.01' name='empty_miles' value='{html_attr(load["empty_miles"])}'></label>
           <select name='status'>{status_opts}</select>
           <select name='driver_id'>{driver_opts}</select>
@@ -3298,6 +3314,10 @@ def delete_invoice(invoice_id):
 
 
 init_db()
+if USE_POSTGRES:
+    execute('ALTER TABLE loads ADD COLUMN IF NOT EXISTS owner_operator_amount TEXT')
+elif 'owner_operator_amount' not in {row['name'] for row in query('PRAGMA table_info(loads)')}:
+    execute('ALTER TABLE loads ADD COLUMN owner_operator_amount TEXT')
 for table in ("loads", "drivers", "customers"):
     if USE_POSTGRES:
         execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS is_deleted INTEGER DEFAULT 0")
