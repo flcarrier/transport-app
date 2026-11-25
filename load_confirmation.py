@@ -3,6 +3,7 @@ import base64
 from datetime import datetime
 from io import BytesIO
 import re
+from difflib import SequenceMatcher
 from flask import request, jsonify
 from PIL import Image, ImageOps
 from pypdf import PdfReader
@@ -207,9 +208,12 @@ def register_confirmation(app, query):
             return jsonify(error='Confirmation text is too long.'), 400
         fields = suggestions(text)
         customer = fields.get('customer_name', '')
-        # An exact unique match only. Never create customers or fuzzy-assign one.
-        matches = query('SELECT id,name FROM customers WHERE COALESCE(is_deleted,0)=0 AND lower(trim(name))=lower(?)', (customer,)) if customer else []
-        return jsonify(fields=fields, labels=FIELDS, customer=({'id': matches[0]['id'], 'name': matches[0]['name']} if len(matches) == 1 else None))
+        # A reviewed suggestion may tolerate a small spelling/OCR difference;
+        # ambiguous or short names are never assigned and no customer is created.
+        customers=query('SELECT id,name FROM customers WHERE COALESCE(is_deleted,0)=0') if customer else []
+        matched=match_customer(customer,customers)
+        if matched:fields['customer_name']=matched['name']
+        return jsonify(fields=fields, labels=FIELDS, customer=matched)
 
 CONFIRMATION_UI = r'''
 <section aria-label="Load confirmation upload" style="border:1px solid #ddd;border-radius:10px;padding:14px;margin:14px 0;">
@@ -296,7 +300,7 @@ CONFIRMATION_UI = r'''
      const previews=document.getElementById('confirmation-pages');previews.replaceChildren();
      pages.forEach((page,i)=>{const img=document.createElement('img');img.src=page.image;img.alt='Confirmation page '+(i+1);img.loading='lazy';img.style.cssText='display:block;max-width:100%;height:auto;margin:10px 0';previews.append(img);});
      document.getElementById('confirmation-text').textContent=text;
-     document.getElementById('confirmation-customer-note').textContent=customer?'Matched existing customer: '+customer.name+'.':'Select the existing customer below if the name does not match exactly. No new customer will be created.';
+     document.getElementById('confirmation-customer-note').textContent=customer?(customer.match_type==='similar'?'Suggested existing customer (check spelling against confirmation): ':'Matched existing customer: ')+customer.name+'.':'Select the existing customer below if the name does not match exactly. No new customer will be created.';
      review.hidden=false;
      status.textContent=Object.keys(result.fields).length?'Suggested details are ready. Check each one, correct anything needed, then use the reviewed details.':'No labeled details were identified. Use the original preview and enter the details in the review fields.';
    }catch(error){if(current===run)status.textContent=error.message||'Reading failed. Try again or enter the details manually.';}
@@ -331,7 +335,7 @@ DATE_PATTERN = r'(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})'
 CITY_PATTERN = re.compile(r"^([A-Za-z][A-Za-z .,'/-]*?)\s*,?\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)(?=\s|$)", re.I)
 HEADER_PATTERN = re.compile(
     r'^(?:(?:stop\s*#?\s*\d+\s*[-:|]?\s*)?)'
-    r'(pick\s*up|p/u|pu|shipper|origin|stop\s*off|so|delivery|deliver|drop\s*off|drop|consignee|destination)'
+    r'(pick\s*up|p/u|pu|shipper|origin|stop\s*off|so|s0|delivery|deliver|drop\s*off|drop|consignee|destination)'
     r'(?![A-Za-z])(?:\s+(?:stop|location))?\s*(?:#?\s*\d+)?\s*[:|\-]?\s*(.*)$', re.I)
 
 
@@ -362,7 +366,7 @@ def confirmation_time(value):
 
 def stop_details(lines,tail):
     fields={}
-    name=re.search(r'(?:^|\s)name\s*:\s*(.+?)(?=\s+(?:date|address|contact|appointment|appt|time)\s*:|$)',tail,re.I)
+    name=re.search(r'(?:^|\s)name\s*:\s*(.+?)(?=\s+(?:date|address|contact|appointment|appt(?:\s+(?:start|end))?|time)\s*:|$)',tail,re.I)
     if name:fields['location_name']=name[1].strip()
     elif tail and not re.match(r'^(?:date|address|city|zip|time|number|no\.?|#)\b',tail,re.I) and not re.search(DATE_PATTERN,tail):
         fields['location_name']=tail.strip(' :|-')
@@ -388,13 +392,13 @@ def stop_details(lines,tail):
             continue
         address=re.match(r'^address\s*:\s*(.*)',line,re.I)
         if address:
-            value=re.split(r'\s+(?:contact|date|phone|time)\s*:',address[1],maxsplit=1,flags=re.I)[0].strip()
+            value=re.split(r'\s+(?:contact|date|phone|time|appt(?:\s+(?:start|end))?|appointment)\s*:',address[1],maxsplit=1,flags=re.I)[0].strip()
             if value:address_parts.append(value)
             address_started=True;continue
         if not address_parts and re.match(r'^\d+\s+[A-Za-z]',line) and not re.search(DATE_PATTERN,line):
-            address_parts.append(re.split(r'\s+(?:contact|phone)\s*:',line,maxsplit=1,flags=re.I)[0]);address_started=True;continue
+            address_parts.append(re.split(r'\s+(?:contact|phone|appt(?:\s+(?:start|end))?|appointment)\s*:',line,maxsplit=1,flags=re.I)[0]);address_started=True;continue
         if address_started:
-            value=re.split(r'\s+(?:contact|date|phone|time)\s*:',line,maxsplit=1,flags=re.I)[0].strip()
+            value=re.split(r'\s+(?:contact|date|phone|time|appt(?:\s+(?:start|end))?|appointment)\s*:',line,maxsplit=1,flags=re.I)[0].strip()
             if value and not re.match(r'^(?:contact|reference|phone|fax|date|time|drvr|hours|appointment|appt|bol|instructions)\b',value,re.I) and not re.search(DATE_PATTERN,value):
                 address_parts.append(value)
             elif re.match(r'^(?:reference|drvr|instructions)\b',line,re.I):address_started=False
@@ -424,7 +428,7 @@ def suggestions(text):
         block=[]
         for line in lines[start+1:end]:
             if re.match(r'^(?:_+|[-=]{4,})$',line):continue
-            if re.match(r'^(?:carrier\s+(?:freight\s+)?pay|total\s+carrier|payment|instructions|agreement|terms)\b',line,re.I):break
+            if re.match(r'^(?:carrier\s+(?:freight\s+)?pay|carrier\s+instructions|special\s+instructions|please\s+sign|total\s+carrier|payment|instructions|agreement|terms)\b',line,re.I):break
             block.append(line)
             if len(block)>=25:break
         fields=stop_details(block,tail)
@@ -440,7 +444,10 @@ def suggestions(text):
     primary_pick=pickups[0] if pickups else None;primary_delivery=deliveries[-1] if deliveries else None
     extra=[x for _,x in valid if x is not primary_pick and x is not primary_delivery]
     for n,stop in enumerate(extra[:2],1):
-        result[f'optional_stop_{n}']=' - '.join(stop[k] for k in ['location_name','address','city'] if stop.get(k))
+        description=' - '.join(stop[k] for k in ['location_name','address','city'] if stop.get(k))
+        appointment=' '.join(stop[k] for k in ['date','time'] if stop.get(k))
+        if appointment:description+=' | Appointment: '+appointment
+        result[f'optional_stop_{n}']=description
         if stop.get('zip'):result[f'optional_stop_{n}_zip']=stop['zip']
     # A broker load/order identifier outranks any BOL or stop reference.
     header='\n'.join(lines[:stops[0][0]] if stops else lines[:25])
@@ -457,15 +464,42 @@ def suggestions(text):
         # Never promote reference numbers that appear inside a stop section.
         header_fields=basic_suggestions(header)
         if 'broker_load_no' not in header_fields:result.pop('broker_load_no',None)
-    # Company mastheads usually contain the broker name without a Customer label.
+    # Prefer the full company masthead over a logo or OCR noise near a logo.
     if not result.get('customer_name'):
+        companies=[]
         for line in lines[:10]:
             company=re.sub(r'\s+Page\s*\d+.*$','',line,flags=re.I).strip()
             if re.search(r'\b(?:logistics|transportation|brokerage|freight\s+(?:services|broker)|RXO|CROWLEY|ARRIVE)\b',company,re.I) and not re.search(r'[:@]|carrier\s*:|load\s+confirmation',company,re.I):
-                result['customer_name']=company;break
+                company=re.sub(r'^[^A-Za-z]+','',company)
+                company=re.split(r'\s+\d',company,maxsplit=1)[0].strip()
+                if company:companies.append(company)
+        if companies:
+            result['customer_name']=max(companies,key=lambda x:(bool(re.search(r'logistics|transportation|brokerage|services',x,re.I)),len(x)))
     # Also read amounts below their label; never choose rate-per-mile or fuel.
-    for pattern in [r'total\s+carrier\s+pay',r'total\s+(?:carrier\s+)?(?:pay|rate|amount)',r'carrier\s+freight\s+pay',r'agreed\s+rate']:
+    for pattern in [r'total\s+carrier\s+pay',r'(?:total\s+)?truck\s+pay',r'total\s+(?:carrier\s+)?(?:pay|rate|amount)',r'carrier\s+freight\s+pay',r'agreed\s+rate']:
         match=re.search(r'(?:'+pattern+r')\s*[:=]?\s*\$?\s*(\d[\d,]*\.\d{2}|\d[\d,]*)\s*(?:USD)?(?=\s|$)',text,re.I)
         if match:
             result['rate']=match[1].replace(',','');break
     return result
+
+
+def match_customer(source,customers):
+    def normalized(value):return re.sub(r'[^a-z0-9]','',str(value).lower())
+    source_key=normalized(source)
+    exact=[x for x in customers if normalized(x['name'])==source_key]
+    if len(exact)==1:return {'id':exact[0]['id'],'name':exact[0]['name'],'match_type':'exact'}
+    if exact or len(source_key)<12:return None
+    ranked=[]
+    for item in customers:
+        target=normalized(item['name'])
+        # Require a matching first business word, not merely a shared suffix.
+        first=re.findall(r'[a-z0-9]+',source.lower())
+        target_first=re.findall(r'[a-z0-9]+',str(item['name']).lower())
+        if not first or not target_first or first[0]!=target_first[0]:continue
+        score=SequenceMatcher(None,source_key,target).ratio()
+        ranked.append((score,item))
+    ranked.sort(key=lambda x:x[0],reverse=True)
+    if not ranked or ranked[0][0]<.88:return None
+    if len(ranked)>1 and ranked[0][0]-ranked[1][0]<.10:return None
+    item=ranked[0][1]
+    return {'id':item['id'],'name':item['name'],'match_type':'similar'}
