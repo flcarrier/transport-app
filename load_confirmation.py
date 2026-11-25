@@ -289,7 +289,7 @@ CONFIRMATION_UI = r'''
      fieldsBox.replaceChildren();customer=result.customer;
      for(const [name,labelText] of Object.entries(result.labels)){
        const label=document.createElement('label');label.append(document.createTextNode(labelText));
-       const input=document.createElement('input');input.dataset.field=name;input.value=result.fields[name]||'';
+       const input=document.createElement('input');input.dataset.field=name;input.value=(result.fields[name]||'').replace(/\r?\n/g,', ');
        input.type=name.endsWith('_date')?'date':name.endsWith('_time')?'time':'text';
        label.append(input);fieldsBox.append(label);
      }
