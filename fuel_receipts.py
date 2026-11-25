@@ -153,6 +153,9 @@ def register_receipts(app, db, query, query_one, execute, normalize_sql, page, e
     execute('''CREATE TABLE IF NOT EXISTS fuel_receipt_batch_pages (
         batch_id TEXT NOT NULL, page_no INTEGER NOT NULL, receipt_id TEXT NOT NULL,
         PRIMARY KEY(batch_id,page_no))''')
+    execute('''CREATE TABLE IF NOT EXISTS fuel_receipt_edits (
+        id TEXT PRIMARY KEY,receipt_id TEXT NOT NULL,edited_at TEXT NOT NULL,
+        before_json TEXT NOT NULL,after_json TEXT NOT NULL)''')
     # Preserve the user's existing card assignments when moving to receipt entry.
     execute('''UPDATE fuel_transactions SET driver_id=(SELECT d.id FROM drivers d
                WHERE d.fuel_card=fuel_transactions.card AND COALESCE(d.is_deleted,0)=0)
@@ -348,7 +351,7 @@ def register_receipts(app, db, query, query_one, execute, normalize_sql, page, e
         notice=f"<p role='alert' style='color:#a11;font-weight:bold;'>Receipt not saved. {esc(message)}</p>" if message else ''
         if saved:
             return page(f"""<div class='card'><h1>Saved Fuel Receipt</h1><p role='status' style='color:#176b32;font-weight:bold;'>Fuel receipt saved successfully.</p>{batch_links(receipt['id'])}<p>This receipt is already saved. Uploading it again will not create another charge.</p>
-              <p>Driver: <strong>{esc(saved['driver_name'])}</strong> · Date: {saved['purchased_on']} · Total: ${saved['cents']/100:,.2f}</p>
+              <p>Driver: <strong>{esc(saved['driver_name'])}</strong> · Date: {saved['purchased_on']} · Gallons: {esc(saved['gallons'])} · Total: ${saved['cents']/100:,.2f}</p><p><a href='/fuel/receipts/{receipt['id']}/edit'>Edit Receipt</a></p>
               <p><a href='/fuel/receipts'>More receipts</a> · <a href='/fuel'>Fuel Reports</a> · <a href='/fuel/receipts/{receipt['id']}/original'>Download original receipt</a></p>{preview}</div>""")
         duplicate_check=("<label><input type='checkbox' name='allow_duplicate' value='yes' style='width:auto;' required> I checked the possible duplicate and this is a different purchase.</label>" if duplicate else '')
         return page(f"""<div class='card'><h1>Review Fuel Receipt</h1>{batch_links(receipt['id'])}{notice}
@@ -517,5 +520,99 @@ def register_receipts(app, db, query, query_one, execute, normalize_sql, page, e
                 return redirect('/fuel/receipts/'+receipt_id)
             return review(receipt,request.form,'The receipt could not be saved. Your uploaded image is still available; please try again.'),409
         return redirect('/fuel/receipts/'+receipt_id)
+
+    def edit_values(row):
+        return dict(driver_id=str(row['driver_id'] or ''),purchased_on=row['purchased_on'],
+                    merchant=row['merchant'] or '',location=row['location'] or '',gallons=str(row['gallons']),
+                    total=str(Decimal(row['cents'])/100),card=row['card'] or '',reference=row['transaction_no'])
+
+    def edit_signature(row):
+        return hashlib.sha256(json.dumps(edit_values(row),sort_keys=True).encode()).hexdigest()
+
+    @app.route('/fuel/receipts/<receipt_id>/edit',methods=['GET','POST'])
+    def edit_saved_receipt(receipt_id):
+        from fuel_reports import iso_date, number
+        receipt=query_one('SELECT * FROM fuel_receipts WHERE id=?',(receipt_id,))
+        if not receipt or not receipt['transaction_id']:
+            return fail('Save and approve this receipt before editing it.',404)
+        saved=query_one('SELECT * FROM fuel_transactions WHERE id=? AND receipt_id=?',(receipt['transaction_id'],receipt_id))
+        if not saved:return fail('Saved fuel purchase not found.',404)
+        fields=edit_values(saved);message='';code=200
+        if request.method=='POST':
+            fields.update({k:request.form.get(k,'').strip() for k in fields})
+            try:
+                if request.form.get('confirmed')!='yes':raise ValueError('Review the corrected receipt and check the confirmation box.')
+                if not fields['driver_id'].isdigit():raise ValueError('Choose a driver.')
+                driver_id=int(fields['driver_id'])
+                driver=query_one('SELECT id FROM drivers WHERE id=? AND (COALESCE(is_deleted,0)=0 OR id=?)',(driver_id,saved['driver_id']))
+                if not driver:raise ValueError('Choose an active driver.')
+                date=iso_date(fields['purchased_on'])
+                gallons=number(fields['gallons']);total=number(fields['total'])
+                if not fields['merchant'] or len(fields['merchant'])>150 or len(fields['location'])>200 or len(fields['reference'])>80:
+                    raise ValueError('Enter the station and keep the station, location and reference within their limits.')
+                if not 0<gallons<=10000 or gallons!=gallons.quantize(Decimal('.001')):raise ValueError('Enter valid gallons with up to three decimal places.')
+                if not 0<total<=1000000 or total!=total.quantize(Decimal('.01')):raise ValueError('Enter a valid fuel total with up to two decimal places.')
+                card=fields['card']
+                if card and not re.fullmatch(r'\d{4,5}',card):raise ValueError('Use the last four or five card digits, or leave the card blank.')
+                cents=int(total*100)
+                with closing(db()) as conn:
+                    try:
+                        if not postgres:conn.execute('BEGIN IMMEDIATE')
+                        current=run(conn,'SELECT * FROM fuel_transactions WHERE id=?'+(' FOR UPDATE' if postgres else ''),(saved['id'],)).fetchone()
+                        if not current or request.form.get('version')!=edit_signature(current):
+                            raise ValueError('This receipt changed since you opened it. Reopen Edit Receipt and review the latest values.')
+                        covered=run(conn,'SELECT report_id FROM driver_fuel_report_items WHERE transaction_id=? AND active=1',(saved['id'],)).fetchone()
+                        if covered and (driver_id!=current['driver_id'] or date!=current['purchased_on']):
+                            raise ValueError('This receipt is covered by a saved fuel report. Void that report coverage using the link below before changing its driver or purchase date.')
+                        duplicates=run(conn,'''SELECT id FROM fuel_transactions WHERE id!=? AND purchased_on=? AND cents=? AND
+                            (driver_id=? OR (driver_id IS NULL AND ?!='' AND card!='' AND (? LIKE (? || card) OR card LIKE ?)))''',
+                            (saved['id'],date,cents,driver_id,card,card,'%', '%'+card)).fetchall()
+                        if duplicates and request.form.get('allow_duplicate')!='yes':
+                            raise ValueError('Possible duplicate: another purchase has this date and amount for the driver/card. Review it and check the different-purchase box if this is correct.')
+                        reference=fields['reference'] or current['transaction_no']
+                        after=dict(driver_id=str(driver_id),purchased_on=date,merchant=fields['merchant'],location=fields['location'],
+                                   gallons=str(gallons),total=str(total),card=card,reference=reference)
+                        if edit_values(current)!=after:
+                            run(conn,'''INSERT INTO fuel_receipt_edits(id,receipt_id,edited_at,before_json,after_json) VALUES (?,?,?,?,?)''',
+                                (uuid.uuid4().hex,receipt_id,datetime.now().isoformat(),json.dumps(edit_values(current)),json.dumps(after)))
+                            run(conn,'''UPDATE fuel_transactions SET driver_id=?,purchased_on=?,posted_on=?,merchant=?,location=?,gallons=?,cents=?,card=?,transaction_no=? WHERE id=?''',
+                                (driver_id,date,date,fields['merchant'],fields['location'],str(gallons),cents,card,reference,current['id']))
+                        conn.commit()
+                    except Exception:
+                        conn.rollback();raise
+                return redirect('/fuel/receipts/'+receipt_id+'?updated=1')
+            except (ValueError,TypeError) as exc:
+                message=str(exc);code=400
+            except Exception:
+                app.logger.exception('Fuel receipt correction failed')
+                message='The correction could not be saved. Your original entry is unchanged. Please reopen the receipt and try again.';code=409
+        drivers=query('SELECT id,name,is_deleted FROM drivers WHERE COALESCE(is_deleted,0)=0 OR id=? ORDER BY name',(saved['driver_id'],))
+        options=''.join(f"<option value='{d['id']}' {'selected' if str(d['id'])==fields['driver_id'] else ''}>{esc(d['name'])}{' (deleted profile)' if d['is_deleted'] else ''}</option>" for d in drivers)
+        coverage=query('SELECT report_id FROM driver_fuel_report_items WHERE transaction_id=? AND active=1',(saved['id'],))
+        coverage_html=' '.join(f"<a href='/fuel/reports/{esc(r['report_id'])}'>View saved fuel report coverage</a>" for r in coverage)
+        history=''
+        for row in query('SELECT * FROM fuel_receipt_edits WHERE receipt_id=? ORDER BY edited_at DESC,id DESC',(receipt_id,)):
+            before=json.loads(row['before_json']);after=json.loads(row['after_json'])
+            changes='; '.join(f"{key.replace('_',' ')}: {before.get(key,'')} → {value}" for key,value in after.items() if before.get(key)!=value)
+            history+=f"<li>{esc(row['edited_at'])}: {esc(changes)}</li>"
+        inputs=''
+        labels={'purchased_on':('Purchase date','date'),'merchant':('Fuel station','text'),'location':('Station city / location','text'),
+                'gallons':('Gallons','number'),'total':('Fuel total paid ($)','number'),'card':('Card last 4 or 5 digits (optional)','text'),'reference':('Receipt / transaction number','text')}
+        for name,(label,kind) in labels.items():
+            step=" step='0.001' min='0.001'" if name=='gallons' else " step='0.01' min='0.01'" if name=='total' else ''
+            required=' required' if name in ('purchased_on','merchant','gallons','total') else ''
+            inputs+=f"<label>{label}<input name='{name}' type='{kind}' value='{esc(fields[name])}'{step}{required}></label>"
+        images=json.loads(receipt['images_json'])
+        preview=''.join(f"<img src='/fuel/receipts/{receipt_id}/image/{n}' alt='Original receipt page {n+1}' style='max-width:100%;max-height:700px;'>" for n in range(len(images)))
+        notice=f"<p role='alert'>{esc(message)}</p>" if message else ''
+        return page(f"""<div class='card'><h1>Edit Fuel Receipt</h1>{notice}
+          <p>Correct the saved entry below. This updates reports using this purchase and keeps the original receipt and correction history. No second fuel charge is created.</p>
+          <p>{coverage_html}</p><div class='form-grid'><div>{preview}</div><form method='post'>
+          <input type='hidden' name='version' value='{esc(request.form.get('version',edit_signature(saved)))}'>
+          <label>Driver<select name='driver_id' required>{options}</select></label>{inputs}
+          <label><input type='checkbox' name='allow_duplicate' value='yes' style='width:auto;'> If a possible duplicate is flagged, I checked that this is a different purchase.</label>
+          <label><input type='checkbox' name='confirmed' value='yes' required style='width:auto;'> I reviewed these corrections against the receipt.</label>
+          <button>Save Receipt Corrections</button><a href='/fuel/receipts/{receipt_id}'>Cancel</a></form></div>
+          <h2>Correction History</h2><ul>{history or '<li>No corrections yet.</li>'}</ul></div>"""),code
 
     return matched_driver

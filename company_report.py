@@ -118,7 +118,8 @@ def register_company_report(app,query,query_one,page,esc,controls,statement_data
             <label>End date<input type='date' name='end' value='{esc(end)}' required></label>
             {controls()}<button>Run / Download Company PDF</button>
             <button formaction='/company-report' formmethod='get'>Load Trips / Enter Miles</button>
-            <button formaction='/company-report/miles' formmethod='post'>Save Miles</button></form>
+            <button formaction='/company-report/miles' formmethod='post'>Save Miles</button>
+            <button type='button' data-clear-report>Clear Entry</button></form>
           <p>Uses the same driver profile, Trip Details Total Miles, empty miles, pay rate, credits and deductions as Driver Report, with confirmation and fuel totals added.</p>
           <p>Load trips to enter empty miles, then run the company PDF.</p></div>{report}""")
 

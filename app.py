@@ -170,6 +170,41 @@ BASE_HTML = """
   </div>
   <hr>
   {{ body|safe }}
+<script>
+(() => {
+ const forms={'/driver-loads':'driver-report-form','/company-report':'company-report-form'};
+ const path=location.pathname,id=forms[path];if(!id)return;
+ const form=document.getElementById(id);if(!form)return;
+ const key='transport-report-entry-v1:'+path;
+ let clearing=false;
+ function read(){try{return JSON.parse(sessionStorage.getItem(key)||'null');}catch(e){return null;}}
+ function fields(){return [...form.elements].filter(el=>el.name&&!['file','password','submit','button'].includes(el.type));}
+ function values(){const result={};fields().forEach(el=>result[el.name]=el.type==='checkbox'?el.checked:el.value);return result;}
+ function queryFor(data){const params=new URLSearchParams();Object.entries(data).forEach(([name,value])=>{if(!name.startsWith('empty_miles_')&&value!==''&&typeof value==='string')params.set(name,value);});return params.toString();}
+ function save(){if(clearing)return;try{const data=values();sessionStorage.setItem(key,JSON.stringify({values:data,query:queryFor(data)}));}catch(e){}}
+ const url=new URL(location.href),previous=read();
+ if(url.searchParams.get('clear_entry')==='1'){
+   try{sessionStorage.removeItem(key);}catch(e){}history.replaceState(null,'',path);
+ }else if(!url.search&&previous&&previous.values?.driver_id&&previous.values?.start&&previous.values?.end){
+   location.replace(path+'?'+previous.query);return;
+ }else if(previous?.values){
+   const data=previous.values,current=values();
+   const explicit=url.searchParams.has('driver_id')||url.searchParams.has('start')||url.searchParams.has('end');
+   const same=!explicit||['driver_id','start','end'].every(name=>(current[name]||'')===(data[name]||''));
+   if(same)fields().forEach(el=>{if(Object.prototype.hasOwnProperty.call(data,el.name)){if(el.type==='checkbox')el.checked=!!data[el.name];else el.value=data[el.name];}});
+ }
+ form.addEventListener('input',save);form.addEventListener('change',save);form.addEventListener('submit',save);
+ // Mileage inputs are associated with the form but may sit outside it.
+ document.addEventListener('input',event=>{if(event.target.form===form)save();});
+ window.addEventListener('pagehide',save);
+ document.querySelectorAll('.nav a').forEach(link=>link.addEventListener('click',save));
+ form.querySelector('[data-clear-report]')?.addEventListener('click',()=>{
+   clearing=true;try{sessionStorage.removeItem(key);}catch(e){}
+   location.assign(path+'?clear_entry=1');
+ });
+})();
+</script>
+
 </body>
 </html>
 """
@@ -2968,6 +3003,7 @@ def driver_report():
         <button>Run / Download PDF</button>
         <button formaction='/driver-loads' formmethod='get'>Load Trips / Enter Miles</button>
         <button formaction='/driver-loads/miles' formmethod='post'>Save Miles</button>
+        <button type='button' data-clear-report>Clear Entry</button>
       </form>
       <p><strong>{rate_message}</strong></p><p role='status'>{saved_message}</p>
       <p>Load trips for the selected dates, enter empty miles below, then Save Miles or Run / Download PDF. Empty miles default to 0; enter additional empty miles when applicable. Loaded miles automatically come from Trip Details Total Miles.</p>
