@@ -110,7 +110,7 @@ def register_statements(app, query, query_one, execute, page, esc, postgres, tri
           <h3>Credits and deductions (optional)</h3>
           <label>Description<input name='adjustment_description' placeholder='Example: Expense reimbursement'></label>
           <label>Amount ($)<input type='number' min='0' step='0.01' name='adjustment_amount'></label>
-          <label>Type<select name='adjustment_type'><option value='credit'>Credit â€” add to check</option><option value='deduction'>Deduction â€” subtract from check</option></select></label>
+          <label>Type<select name='adjustment_type'><option value='credit'>Credit — add to check</option><option value='deduction'>Deduction — subtract from check</option></select></label>
           </details>"""
 
     def report_context():

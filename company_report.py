@@ -53,7 +53,7 @@ def register_company_report(app,query,query_one,page,esc,controls,statement_data
         return driver,start,end,loads,info,trips,adjustments,company
 
     def money(value):
-        return f'${value:,.2f}' if value is not None else 'Not set â€” incomplete'
+        return f'${value:,.2f}' if value is not None else 'Not set — incomplete'
 
     @app.route('/company-report')
     def company_report():
@@ -101,11 +101,11 @@ def register_company_report(app,query,query_one,page,esc,controls,statement_data
                 receipt=f"<a href='/fuel/receipts/{esc(row['receipt_id'])}'>View receipt</a>" if row['receipt_id'] else 'Imported fuel'
                 fuel_rows+=f"<tr><td>{esc(row['purchased_on'])}</td><td>{esc(row['transaction_no'])}</td><td>{esc(row['merchant'])}<br>{esc(row['location'])}</td><td>{esc(row['gallons'])}</td><td>{money(Decimal(row['cents'])/100)}</td><td>{'Earlier unreported fuel' if row['purchased_on']<start else 'Within date range'}</td><td>{receipt}</td></tr>"
             rate=f"${pay['rate']:.4f} per mile" if pay['rate'] is not None else 'Not set in driver profile'
-            report=f"""<div class='card'><h2>{esc(driver['name'])} â€” Company Report</h2><p>{start} through {end} Â· Driver rate: {rate}</p>
+            report=f"""<div class='card'><h2>{esc(driver['name'])} — Company Report</h2><p>{start} through {end} · Driver rate: {rate}</p>
               <table>{totals}</table><p>Confirmation amounts use each load's saved rate; they do not indicate whether the broker has paid.</p>
               <p>Fuel totals include {money(company['earlier_cost'])} and {company['earlier_gallons']:,.3f} gallons of earlier unreported fuel.
               Fuel is shown separately and does not reduce the driver check amount.</p>
-              <p>Company balance = total confirmation amounts âˆ’ driver check amount âˆ’ total fuel cost. The driver check already includes credits and deductions, so those adjustments are not counted twice. Other company expenses are not recorded in this report.</p>
+              <p>Company balance = total confirmation amounts − driver check amount − total fuel cost. The driver check already includes credits and deductions, so those adjustments are not counted twice. Other company expenses are not recorded in this report.</p>
               <h2>Paid Miles for This Report</h2><div style='overflow:auto;'><table><tr><th>Trip #</th><th>Date</th><th>Route</th><th>Loaded miles</th><th>Empty miles</th><th>Total miles</th><th>Driver pay</th></tr>{miles or '<tr><td colspan="7">No trips in the selected date range.</td></tr>'}</table></div>
               <h2>Trip Details / Confirmation Amounts</h2><div style='overflow:auto;'><table><tr><th>Load #</th><th>Customer</th><th>Origin</th><th>Origin ZIP</th><th>Stop 1</th><th>Stop 1 ZIP</th><th>Stop 2</th><th>Stop 2 ZIP</th><th>Destination</th><th>Destination ZIP</th><th>Confirmation amount</th><th>Status</th></tr>{detail}</table></div>
               <h2>Fuel Purchases</h2><p>{company['receipt_count']} approved scanned receipt(s) in selected dates: {company['receipt_gallons']:,.3f} gallons / {money(company['receipt_cost'])}.</p><p>Gallons and costs come from saved receipts/imports. Within-date purchases are shown even if already included in a fuel report. Older purchases are included only when no prior report covers them.</p>

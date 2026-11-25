@@ -1350,7 +1350,7 @@ def drivers():
         <form method='post'>
           <input name='name' placeholder='Driver name' required>
           <label>Driver pay per mile ($)<input name='pay_rate_per_mile' type='number' min='0' step='0.0001' placeholder='Optional: enter agreed pay rate'></label>
-          <label>Fuel card â€” last 4 or 5 digits<input name='fuel_card' inputmode='numeric' pattern='[0-9]{{4,5}}' maxlength='5' placeholder='Optional: 01531'></label>
+          <label>Fuel card — last 4 or 5 digits<input name='fuel_card' inputmode='numeric' pattern='[0-9]{{4,5}}' maxlength='5' placeholder='Optional: 01531'></label>
           <button>Add</button>
         </form>
       </div>
