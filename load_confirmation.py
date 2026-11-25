@@ -50,7 +50,7 @@ def document_pages(data):
                 bitmap = None
                 try:
                     width, height = pdf_page.get_size()
-                    bitmap = pdf_page.render(scale=min(2.0, 1800 / max(width, height)))
+                    bitmap = pdf_page.render(scale=min(3.0, 2400 / max(width, height)))
                     image = bitmap.to_pil().convert('RGB')
                     pages.append(image_page(image, (page.extract_text() or '')[:40000]))
                 finally:
@@ -72,18 +72,18 @@ def document_pages(data):
             for i in range(getattr(source, 'n_frames', 1)):
                 source.seek(i)
                 image = ImageOps.exif_transpose(source).convert('RGB')
-                image.thumbnail((1800, 1800))
+                image.thumbnail((2400, 2400))
                 pages.append(image_page(image, ''))
     return pages
 
 
 def image_page(image, text):
     output = BytesIO()
-    image.save(output, 'JPEG', quality=86)
-    return {'image': 'data:image/jpeg;base64,' + base64.b64encode(output.getvalue()).decode('ascii'), 'text': text}
+    image.save(output, 'JPEG', quality=92)
+    return {'image': 'data:image/jpeg;base64,' + base64.b64encode(output.getvalue()).decode('ascii'), 'text': text, 'field_count': len(suggestions(text))}
 
 
-def suggestions(text):
+def basic_suggestions(text):
     lines = [re.sub(r'[\t ]+', ' ', line).strip() for line in str(text)[:180000].splitlines() if line.strip()]
     result = {}
     labels = {
@@ -274,7 +274,7 @@ CONFIRMATION_UI = r'''
      for(let i=0;i<pages.length;i++){
        if(current!==run)return;
        const page=pages[i];let pageText=page.text;
-       if(pageText.replace(/\s/g,'').length<60){
+       if(pageText.replace(/\s/g,'').length<60||(i===0&&(page.field_count||0)<5)){
          status.textContent='Reading scanned page '+(i+1)+' of '+pages.length+'…';
          await loadOcr();if(current!==run)return;
          if(!worker){const created=await Tesseract.createWorker('eng',1,{logger:m=>{if(current===run&&m.status==='recognizing text')status.textContent='Reading page '+(i+1)+' of '+pages.length+': '+Math.round(m.progress*100)+'%';}});if(current!==run){await created.terminate().catch(()=>{});return;}worker=created;}
@@ -324,3 +324,148 @@ CONFIRMATION_UI = r'''
 })();
 </script>
 '''
+
+# Confirmations often use stop tables, inline labels and date/time pairs instead
+# of one app-style label per line. Keep these rules separate from basic labels.
+DATE_PATTERN = r'(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})'
+CITY_PATTERN = re.compile(r"^([A-Za-z][A-Za-z .,'/-]*?)\s*,?\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)(?=\s|$)", re.I)
+HEADER_PATTERN = re.compile(
+    r'^(?:(?:stop\s*#?\s*\d+\s*[-:|]?\s*)?)'
+    r'(pick\s*up|p/u|pu|shipper|origin|stop\s*off|so|delivery|deliver|drop\s*off|drop|consignee|destination)'
+    r'(?![A-Za-z])(?:\s+(?:stop|location))?\s*(?:#?\s*\d+)?\s*[:|\-]?\s*(.*)$', re.I)
+
+
+def confirmation_date(value):
+    m=re.search(DATE_PATTERN,value)
+    if not m:return None
+    token=m[0].replace('.','/').replace('-','/')
+    formats=('%Y/%m/%d','%m/%d/%Y','%m/%d/%y')
+    for fmt in formats:
+        try:return datetime.strptime(token,fmt).strftime('%Y-%m-%d')
+        except ValueError:pass
+    return None
+
+
+def confirmation_time(value):
+    # Look only at time-labeled text or the portion AFTER a recognized date.
+    m=re.search(DATE_PATTERN,value)
+    if m:value=value[m.end():]
+    value=re.sub(r'^\s*(?:at|time|appt\.?|appointment)\s*[:=]?\s*','',value,flags=re.I)
+    match=re.search(r'(?<!\d)(\d{1,2}:\d{2}\s*(?:[AP]\.?M\.?)?|\d{1,2}\s*[AP]\.?M\.?|\d{4})(?!\d)',value,re.I)
+    if not match:return None
+    token=match[0].upper().replace('.','').replace(' ','')
+    for fmt in ('%H:%M','%I:%M%p','%I%p','%H%M'):
+        try:return datetime.strptime(token,fmt).strftime('%H:%M')
+        except ValueError:pass
+    return None
+
+
+def stop_details(lines,tail):
+    fields={}
+    name=re.search(r'(?:^|\s)name\s*:\s*(.+?)(?=\s+(?:date|address|contact|appointment|appt|time)\s*:|$)',tail,re.I)
+    if name:fields['location_name']=name[1].strip()
+    elif tail and not re.match(r'^(?:date|address|city|zip|time|number|no\.?|#)\b',tail,re.I) and not re.search(DATE_PATTERN,tail):
+        fields['location_name']=tail.strip(' :|-')
+    block=[tail]+lines
+    address_parts=[];address_started=False
+    for raw in block:
+        line=raw.strip()
+        if not line:continue
+        date=confirmation_date(line)
+        if date and (re.search(r'\b(?:date|appt|appointment|scheduled|arrival)\b',line,re.I) or re.match(r'^'+DATE_PATTERN,line)):
+            fields.setdefault('date',date)
+            time=confirmation_time(line)
+            if time:fields.setdefault('time',time)
+        if re.match(r'^(?:time|appt\.?\s*time|appointment\s*time)\s*[:=]',line,re.I):
+            time=confirmation_time(re.split(r'[:=]',line,maxsplit=1)[1])
+            if time:fields.setdefault('time',time)
+        # Strip only known column labels, retaining facility/address values.
+        clean=re.sub(r'^(?:city\s*[/,]\s*state(?:\s*[/,]\s*zip)?|city|location)\s*:\s*','',line,flags=re.I)
+        city=CITY_PATTERN.match(clean)
+        if city:
+            fields['city']=city[1].strip(' ,')+', '+city[2].upper();fields['zip']=city[3]
+            address_started=False
+            continue
+        address=re.match(r'^address\s*:\s*(.*)',line,re.I)
+        if address:
+            value=re.split(r'\s+(?:contact|date|phone|time)\s*:',address[1],maxsplit=1,flags=re.I)[0].strip()
+            if value:address_parts.append(value)
+            address_started=True;continue
+        if not address_parts and re.match(r'^\d+\s+[A-Za-z]',line) and not re.search(DATE_PATTERN,line):
+            address_parts.append(re.split(r'\s+(?:contact|phone)\s*:',line,maxsplit=1,flags=re.I)[0]);address_started=True;continue
+        if address_started:
+            value=re.split(r'\s+(?:contact|date|phone|time)\s*:',line,maxsplit=1,flags=re.I)[0].strip()
+            if value and not re.match(r'^(?:contact|reference|phone|fax|date|time|drvr|hours|appointment|appt|bol|instructions)\b',value,re.I) and not re.search(DATE_PATTERN,value):
+                address_parts.append(value)
+            elif re.match(r'^(?:reference|drvr|instructions)\b',line,re.I):address_started=False
+        if 'location_name' not in fields and not re.search(r'[:=]',line) and not re.search(DATE_PATTERN,line) and not re.match(r'^\d',line) and not re.match(r'^(?:contact|reference|phone|date|time)\b',line,re.I):
+            fields['location_name']=line
+    if address_parts:fields['address']='\n'.join(address_parts[:3])
+    return fields
+
+
+def suggestions(text):
+    text=str(text)[:180000].replace('\u00a0',' ')
+    lines=[re.sub(r'[\t ]+',' ',line).strip() for line in text.splitlines() if line.strip()]
+    result=basic_suggestions(text)
+    stops=[]
+    for i,line in enumerate(lines):
+        m=HEADER_PATTERN.match(line)
+        if not m:continue
+        kind=m[1].lower();tail=m[2].strip()
+        # These are ordinary field labels, not the start of a stop section.
+        if re.match(r'^(?:date|address|city|zip|time|number|no\.?|#)\b',tail,re.I):continue
+        if not tail and re.search(r'\b(?:number|no)\b',line,re.I):continue
+        side='pickup' if re.match(r'pick|p/u|pu$|shipper|origin',kind,re.I) else 'delivery'
+        stops.append((i,side,tail))
+    valid=[]
+    for n,(start,side,tail) in enumerate(stops):
+        end=stops[n+1][0] if n+1<len(stops) else len(lines)
+        block=[]
+        for line in lines[start+1:end]:
+            if re.match(r'^(?:_+|[-=]{4,})$',line):continue
+            if re.match(r'^(?:carrier\s+(?:freight\s+)?pay|total\s+carrier|payment|instructions|agreement|terms)\b',line,re.I):break
+            block.append(line)
+            if len(block)>=25:break
+        fields=stop_details(block,tail)
+        if fields.get('city') or fields.get('address'):
+            valid.append((side,fields))
+    pickups=[x for side,x in valid if side=='pickup'];deliveries=[x for side,x in valid if side=='delivery']
+    for side,stop in [('pickup',pickups[0] if pickups else None),('delivery',deliveries[-1] if deliveries else None)]:
+        if not stop:continue
+        for suffix in ['location_name','address','date','time']:
+            if stop.get(suffix):result[f'{side}_{suffix}']=stop[suffix]
+        for suffix,key in [('city','origin' if side=='pickup' else 'destination'),('zip','origin_zip' if side=='pickup' else 'destination_zip')]:
+            if stop.get(suffix):result[key]=stop[suffix]
+    primary_pick=pickups[0] if pickups else None;primary_delivery=deliveries[-1] if deliveries else None
+    extra=[x for _,x in valid if x is not primary_pick and x is not primary_delivery]
+    for n,stop in enumerate(extra[:2],1):
+        result[f'optional_stop_{n}']=' - '.join(stop[k] for k in ['location_name','address','city'] if stop.get(k))
+        if stop.get('zip'):result[f'optional_stop_{n}_zip']=stop['zip']
+    # A broker load/order identifier outranks any BOL or stop reference.
+    header='\n'.join(lines[:stops[0][0]] if stops else lines[:25])
+    identifiers=[r'\b(?:broker\s+)?load\s*(?:number|no\.?|#)\s*[:=#]?\s*([A-Z0-9][A-Z0-9./_-]*)',
+                 r'\border\s+order\s*:\s*([A-Z0-9][A-Z0-9./_-]*)',
+                 r'\b(?:order|shipment|trip)\s*(?:number|no\.?|#|:)\s*[:=#]?\s*([A-Z0-9][A-Z0-9./_-]*)',
+                 r'\breference\s*:\s*([A-Z0-9][A-Z0-9./_-]*)']
+    found_id=False
+    for pattern in identifiers:
+        m=re.search(pattern,header,re.I)
+        if m:
+            result['broker_load_no']=m[1];found_id=True;break
+    if not found_id and 'broker_load_no' in result:
+        # Never promote reference numbers that appear inside a stop section.
+        header_fields=basic_suggestions(header)
+        if 'broker_load_no' not in header_fields:result.pop('broker_load_no',None)
+    # Company mastheads usually contain the broker name without a Customer label.
+    if not result.get('customer_name'):
+        for line in lines[:10]:
+            company=re.sub(r'\s+Page\s*\d+.*$','',line,flags=re.I).strip()
+            if re.search(r'\b(?:logistics|transportation|brokerage|freight\s+(?:services|broker)|RXO|CROWLEY|ARRIVE)\b',company,re.I) and not re.search(r'[:@]|carrier\s*:|load\s+confirmation',company,re.I):
+                result['customer_name']=company;break
+    # Also read amounts below their label; never choose rate-per-mile or fuel.
+    for pattern in [r'total\s+carrier\s+pay',r'total\s+(?:carrier\s+)?(?:pay|rate|amount)',r'carrier\s+freight\s+pay',r'agreed\s+rate']:
+        match=re.search(r'(?:'+pattern+r')\s*[:=]?\s*\$?\s*(\d[\d,]*\.\d{2}|\d[\d,]*)\s*(?:USD)?(?=\s|$)',text,re.I)
+        if match:
+            result['rate']=match[1].replace(',','');break
+    return result
