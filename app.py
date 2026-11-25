@@ -1241,10 +1241,15 @@ def delete_load(load_id):
 
 @app.route("/loads/<int:load_id>/restore", methods=["POST"])
 def restore_load(load_id):
-    if not query_one("SELECT id FROM loads WHERE id=?", (load_id,)):
-        return "Load not found", 404
-    execute("UPDATE loads SET is_deleted=0 WHERE id=?", (load_id,))
-    return redirect("/loads")
+    load=query_one('SELECT id,load_no FROM loads WHERE id=?',(load_id,))
+    if not load:
+        return 'Load not found',404
+    try:
+        validate_load_number(load['load_no'],load_id)
+        execute_load_write('UPDATE loads SET is_deleted=0 WHERE id=?',(load_id,))
+    except ValueError as exc:
+        return page(f"<p role='alert'>{html_attr(str(exc))}</p><a href='/loads'>Back to Loads</a>"),400
+    return redirect('/loads')
 
 
 @app.route("/drivers/<int:driver_id>/delete", methods=["POST"])
@@ -1549,14 +1554,35 @@ def delete_trailer(trailer_id):
     return redirect("/trucks")
 
 
+def validate_load_number(value, exclude_id=0):
+    number=str(value or '').strip()
+    if not number:
+        raise ValueError('Enter an internal load number.')
+    if query_one("SELECT id FROM loads WHERE lower(trim(load_no))=lower(?) AND id!=?",(number,exclude_id)):
+        raise ValueError(f'Internal load number {number} already exists, including deleted load history. Enter a different number.')
+    return number
+
+
+def execute_load_write(sql, params):
+    try:
+        execute(sql,params)
+    except Exception as exc:
+        if isinstance(exc,sqlite3.IntegrityError) or getattr(exc,'pgcode',None)=='23505' or getattr(exc,'sqlstate',None)=='23505':
+            raise ValueError('That internal load number was just used by another load. Refresh and choose a different number.') from exc
+        raise
+
+
 def next_internal_load_number():
-    # Follow the last entered numeric internal number, not the broker number.
-    # Keep deleted records in the sequence so their numbers are not reused.
-    for row in query("SELECT load_no FROM loads ORDER BY id DESC"):
-        value = str(row["load_no"] or "").strip()
-        if re.fullmatch(r"[0-9]+", value):
-            return str(int(value) + 1).zfill(len(value))
-    return ""
+    rows=query('SELECT load_no FROM loads ORDER BY id DESC')
+    used={str(r['load_no'] or '').strip().lower() for r in rows}
+    for row in rows:
+        value=str(row['load_no'] or '').strip()
+        if re.fullmatch(r'[0-9]+',value):
+            candidate=str(int(value)+1).zfill(len(value))
+            while candidate.lower() in used:
+                candidate=str(int(candidate)+1).zfill(len(value))
+            return candidate
+    return ''
 
 
 def parse_owner_operator_amount(value):
@@ -1576,47 +1602,49 @@ def loads():
             loaded_miles = mileage_input(request.form.get("loaded_miles"))
             empty_miles = mileage_input(request.form.get("empty_miles"))
             owner_operator_amount = parse_owner_operator_amount(request.form.get("owner_operator_amount"))
-        except ValueError as exc:
-            return page(f"<p>{html_attr(str(exc))}</p><a href='/loads'>Back to Loads</a>"), 400
-        execute(
-            """
-            INSERT INTO loads (
-                load_no, broker_load_no, trailer_id, optional_stop_1, optional_stop_1_zip, optional_stop_2, optional_stop_2_zip,
-                pickup_location_name, pickup_address, origin, origin_zip,
-                delivery_location_name, delivery_address, destination, destination_zip,
-                pickup_date, pickup_time, delivery_date, delivery_time, rate, status, driver_id, truck_id, customer_id, loaded_miles, empty_miles, owner_operator_amount
+            load_number = validate_load_number(request.form.get("load_no"))
+            execute_load_write(
+                """
+                INSERT INTO loads (
+                    load_no, broker_load_no, trailer_id, optional_stop_1, optional_stop_1_zip, optional_stop_2, optional_stop_2_zip,
+                    pickup_location_name, pickup_address, origin, origin_zip,
+                    delivery_location_name, delivery_address, destination, destination_zip,
+                    pickup_date, pickup_time, delivery_date, delivery_time, rate, status, driver_id, truck_id, customer_id, loaded_miles, empty_miles, owner_operator_amount, pickup_number
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    load_number,
+                    request.form.get("broker_load_no"),
+                    request.form.get("trailer_id") or None,
+                    request.form.get("optional_stop_1"),
+                    request.form.get("optional_stop_1_zip"),
+                    request.form.get("optional_stop_2"),
+                    request.form.get("optional_stop_2_zip"),
+                    request.form.get("pickup_location_name"),
+                    request.form.get("pickup_address"),
+                    request.form.get("origin"),
+                    request.form.get("origin_zip"),
+                    request.form.get("delivery_location_name"),
+                    request.form.get("delivery_address"),
+                    request.form.get("destination"),
+                    request.form.get("destination_zip"),
+                    request.form.get("pickup_date") or None,
+                    request.form.get("pickup_time") or None,
+                    request.form.get("delivery_date") or None,
+                    request.form.get("delivery_time") or None,
+                    request.form.get("rate") or 0,
+                    request.form.get("status"),
+                    request.form.get("driver_id") or None,
+                    request.form.get("truck_id") or None,
+                    request.form.get("customer_id") or None,
+                    loaded_miles, empty_miles, owner_operator_amount, request.form.get("pickup_number", "").strip(),
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                request.form.get("load_no"),
-                request.form.get("broker_load_no"),
-                request.form.get("trailer_id") or None,
-                request.form.get("optional_stop_1"),
-                request.form.get("optional_stop_1_zip"),
-                request.form.get("optional_stop_2"),
-                request.form.get("optional_stop_2_zip"),
-                request.form.get("pickup_location_name"),
-                request.form.get("pickup_address"),
-                request.form.get("origin"),
-                request.form.get("origin_zip"),
-                request.form.get("delivery_location_name"),
-                request.form.get("delivery_address"),
-                request.form.get("destination"),
-                request.form.get("destination_zip"),
-                request.form.get("pickup_date") or None,
-                request.form.get("pickup_time") or None,
-                request.form.get("delivery_date") or None,
-                request.form.get("delivery_time") or None,
-                request.form.get("rate") or 0,
-                request.form.get("status"),
-                request.form.get("driver_id") or None,
-                request.form.get("truck_id") or None,
-                request.form.get("customer_id") or None,
-                loaded_miles, empty_miles, owner_operator_amount,
-            ),
-        )
-        return redirect("/loads")
+            return redirect("/loads")
+
+        except ValueError as exc:
+            return page(f"<div class='card'><h1>Load not saved</h1><p role='alert'>{html_attr(str(exc))}</p><a href='/loads'>Back to Loads</a></div>"),400
 
     drivers = query("SELECT * FROM drivers WHERE COALESCE(is_deleted, 0) = 0 ORDER BY name")
     trucks = query("SELECT * FROM trucks ORDER BY unit_no")
@@ -1652,6 +1680,11 @@ def loads():
         for tr in trailers
     )
 
+    def detail(label,value):
+        if value is None or str(value).strip()=='':
+            return ''
+        return f"<div class='load-detail'><strong>{html_attr(label)}:</strong> {html_attr(value)}</div>"
+
     tr = ""
     for l in loads_list:
         file_items = files_by_load.get(l["id"], [])
@@ -1680,66 +1713,72 @@ def loads():
 
         tr += f"""
         <tr data-load-row class='{invoiced_class}'>
-          <td>{l['load_no'] or ''}</td>
-          <td>{l['broker_load_no'] or ''}</td>
-          <td>{l['trailer_no'] or l['load_trailer_no'] or ''}</td>
-          <td>{l['customer_name'] or ''}</td>
-          <td>{l['pickup_location_name'] or ''}</td>
-          <td>{l['pickup_address'] or ''}</td>
-          <td>{l['origin'] or ''}</td>
-          <td>{l['origin_zip'] or ''}</td>
-          <td>{l['pickup_date'] or ''}</td>
-          <td>{l['pickup_time'] or ''}</td>
-          <td>{l['delivery_location_name'] or ''}</td>
-          <td>{l['delivery_address'] or ''}</td>
-          <td>{l['destination'] or ''}</td>
-          <td>{l['destination_zip'] or ''}</td>
-          <td>{l['delivery_date'] or ''}</td>
-          <td>{l['delivery_time'] or ''}</td>
-          <td>${float(l['rate'] or 0):,.2f}</td>
-          <td>{('$'+format(float(l['owner_operator_amount']),',.2f')) if l['owner_operator_amount'] is not None else 'Not set'}</td>
-          <td>{l['optional_stop_1'] or ''}</td>
-          <td>{l['optional_stop_1_zip'] or ''}</td>
-          <td>{l['optional_stop_2'] or ''}</td>
-          <td>{l['optional_stop_2_zip'] or ''}</td>
-          <td>{l['driver_name'] or ''}</td>
-          <td>{l['truck_unit'] or ''}</td>
-          <td>{l['status'] or ''}</td>
-          <td>
+          <td data-label='Load / References'>
+            {detail('Load #',l['load_no'])}{detail('Broker Load #',l['broker_load_no'])}
+            {detail('PU #',l['pickup_number'])}{detail('Customer',l['customer_name'])}{invoice_cell}
+          </td>
+          <td data-label='Pickup'>
+            {detail('Pickup name',l['pickup_location_name'])}{detail('Address',l['pickup_address'])}
+            {detail('City / State',l['origin'])}{detail('ZIP',l['origin_zip'])}
+            {detail('Pickup date',l['pickup_date'])}{detail('Pickup time',l['pickup_time'])}
+          </td>
+          <td data-label='Delivery'>
+            {detail('Delivery name',l['delivery_location_name'])}{detail('Address',l['delivery_address'])}
+            {detail('City / State',l['destination'])}{detail('ZIP',l['destination_zip'])}
+            {detail('Delivery date',l['delivery_date'])}{detail('Delivery time',l['delivery_time'])}
+          </td>
+          <td data-label='Stops / Equipment'>
+            {detail('Stop 1',l['optional_stop_1'])}{detail('Stop 1 ZIP',l['optional_stop_1_zip'])}
+            {detail('Stop 2',l['optional_stop_2'])}{detail('Stop 2 ZIP',l['optional_stop_2_zip'])}
+            {detail('Driver',l['driver_name'])}{detail('Truck',l['truck_unit'])}
+            {detail('Trailer',l['trailer_no'] or l['load_trailer_no'])}
+          </td>
+          <td data-label='Amounts / Status'>
+            {detail('Rate','$'+format(float(l['rate'] or 0),',.2f'))}
+            {detail('Owner Operator Amount',('$'+format(float(l['owner_operator_amount']),',.2f')) if l['owner_operator_amount'] is not None else 'Not set')}
+            {detail('Paid empty miles',l['empty_miles'])}{detail('Status',l['status'])}
             <form method='post' action='/update-status/{l['id']}' class='inline-form'>
-              <select name='status'>
-                {''.join(f"<option value='{s}' {'selected' if s == l['status'] else ''}>{s}</option>" for s in LOAD_STATUSES)}
-              </select>
-              <button>Update</button>
+              <select name='status' aria-label='Status for load {l['id']}'>
+                {''.join(f"<option value='{status}' {'selected' if status==l['status'] else ''}>{status}</option>" for status in LOAD_STATUSES)}
+              </select><button>Update</button>
             </form>
           </td>
-          <td>
-            <a href='/loads/{l["id"]}/edit'>Edit</a>
-            <form method='post' action='/loads/{l["id"]}/delete' onsubmit="return confirm('Delete this load from the load board? Existing invoices and paperwork will be kept.');">
+          <td data-label='Paperwork / Actions'>
+            <a href='/loads/{l['id']}/edit'>Edit</a>
+            <form method='post' action='/loads/{l['id']}/delete' onsubmit="return confirm('Delete this load from the load board? Existing invoices and paperwork will be kept.');">
               <button type='submit' style='background:#ffdddd;'>Delete Load</button>
             </form>
-          </td>
-          <td>
-            {invoice_cell}
-          </td>
-          <td>
-            <div class='upload-box'>
-              <form method='post' action='/loads/{l['id']}/upload' enctype='multipart/form-data'>
-                <input type='file' name='file' required>
-                <button>Upload</button>
-              </form>
-              {file_html}
-            </div>
+            <div class='upload-box'><form method='post' action='/loads/{l['id']}/upload' enctype='multipart/form-data'>
+              <input type='file' name='file' aria-label='Paperwork for load {l['id']}' required><button>Upload</button>
+            </form>{file_html}</div>
           </td>
         </tr>
         """
 
     if not tr:
-        tr = "<tr><td colspan='29'>No loads yet.</td></tr>"
+        tr = "<tr><td colspan='6'>No loads yet.</td></tr>"
 
     return page(f"""
     {deleted_records_panel('loads')}
-    <div class='grid'>
+    <style>
+      .loads-page {{display:grid;grid-template-columns:minmax(0,1fr);gap:16px;max-width:100%;}}
+      .loads-page .card,.loads-page .form-grid>* {{min-width:0;max-width:100%;}}
+      .loads-page .form-grid {{grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr));}}
+      #load_board_table {{width:100%;table-layout:fixed;font-size:12px;}}
+      #load_board_table th,#load_board_table td {{overflow-wrap:anywhere;word-break:normal;padding:8px;vertical-align:top;}}
+      #load_board_table input,#load_board_table select,#load_board_table button {{max-width:100%;min-width:0;width:100%;}}
+      #load_board_table .upload-box {{min-width:0;max-width:100%;}}
+      #load_board_table ul {{padding-left:15px;margin:6px 0;}}
+      #load_board_table .inline-form {{display:block;}}
+      .load-detail {{margin-bottom:6px;white-space:normal;}}
+      @media(max-width:950px) {{
+        #load_board_table thead {{display:none;}}
+        #load_board_table,#load_board_table tbody,#load_board_table tr,#load_board_table td {{display:block;box-sizing:border-box;width:100%;}}
+        #load_board_table tr[data-load-row] {{margin-bottom:18px;border:1px solid #ddd;border-radius:8px;overflow:hidden;}}
+        #load_board_table td[data-label]::before {{content:attr(data-label);display:block;font-weight:bold;font-size:14px;margin-bottom:8px;}}
+      }}
+    </style>
+    <div class='loads-page'>
       <div class='card'>
         <h1>Loads</h1>
         {uninvoiced_loads_total()}
@@ -1748,6 +1787,7 @@ def loads():
           <div class='form-grid'>
             <label>Internal Load # (editable)<input name='load_no' placeholder='Load # / Internal Load #' value='{html_attr(next_internal_load_number())}' required></label>
             <input name='broker_load_no' placeholder='Broker Load #'>
+            <label>PU #<input name='pickup_number' maxlength='150' placeholder='Pickup number (optional)'></label>
             <div class='customer-search-box'>
               <input type='text' id='customer_search' placeholder='Type customer name' autocomplete='off'>
               <input type='hidden' name='customer_id' id='customer_id'>
@@ -1786,71 +1826,10 @@ def loads():
       <div class='card'>
         <h2>Load Board</h2>
         <p class='muted'>Use the filter boxes under each heading to search the load board.</p>
+        <label>Search all load information<input id='load-board-search' placeholder='Load #, PU #, customer, driver, address...'></label>
         <table id='load_board_table'>
-          <thead>
-            <tr>
-              <th>Load #</th>
-              <th>Broker Load #</th>
-              <th>Trailer #</th>
-              <th>Customer</th>
-              <th>Pickup Name</th>
-              <th>Pickup Address</th>
-              <th>Pickup City/State</th>
-              <th>Pickup ZIP</th>
-              <th>Pickup Date</th>
-              <th>Pickup Time</th>
-              <th>Delivery Name</th>
-              <th>Delivery Address</th>
-              <th>Delivery City/State</th>
-              <th>Delivery ZIP</th>
-              <th>Delivery Date</th>
-              <th>Delivery Time</th>
-              <th>Rate</th>
-              <th>Owner Operator Amount</th>
-              <th>Optional Stop 1</th>
-              <th>Stop 1 ZIP</th>
-              <th>Optional Stop 2</th>
-              <th>Stop 2 ZIP</th>
-              <th>Driver</th>
-              <th>Truck</th>
-              <th>Status</th>
-              <th>Change Status</th>
-              <th>Actions</th>
-              <th>Invoice</th>
-              <th>Files</th>
-            </tr>
-            <tr>
-              <th><input class='load-filter' data-col='0' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='1' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='2' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='3' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='4' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='5' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='6' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='7' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='8' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='9' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='10' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='11' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='12' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='13' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='14' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='15' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='16' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='17' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='18' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='19' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='20' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='21' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='22' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='23' placeholder='Search'></th>
-              <th><input class='load-filter' data-col='24' placeholder='Search'></th>
-              <th></th>
-              <th></th>
-              <th></th>
-              <th></th>
-            </tr>
-          </thead>
+          <thead><tr><th>Load / References</th><th>Pickup</th><th>Delivery</th><th>Stops / Equipment</th><th>Amounts / Status</th><th>Paperwork / Actions</th></tr>
+          <tr>{''.join(f"<th><input class='load-filter' data-col='{n}' placeholder='Search' aria-label='Search {name}'></th>" for n,name in enumerate(['load references','pickup','delivery','stops and equipment','amounts and status','paperwork']))}</tr></thead>
           <tbody>
             {tr}
           </tbody>
@@ -1924,11 +1903,13 @@ def loads():
 
         document.querySelectorAll('#load_board_table tbody tr[data-load-row]').forEach(row => {{
           const cells = row.querySelectorAll('td');
-          const show = filters.every(f => (cells[f.col]?.innerText || '').toLowerCase().includes(f.value));
+          const search=document.getElementById('load-board-search').value.trim().toLowerCase();
+          const show = row.innerText.toLowerCase().includes(search) && filters.every(f => (cells[f.col]?.innerText || '').toLowerCase().includes(f.value));
           row.style.display = show ? '' : 'none';
         }});
       }}
 
+      document.getElementById('load-board-search').addEventListener('input',filterLoadBoard);
       document.querySelectorAll('.load-filter').forEach(input => {{
         input.addEventListener('input', filterLoadBoard);
       }});
@@ -1947,49 +1928,51 @@ def edit_load(load_id):
             loaded_miles = mileage_input(request.form.get("loaded_miles", load["loaded_miles"]))
             empty_miles = mileage_input(request.form.get("empty_miles", load["empty_miles"]))
             owner_operator_amount = parse_owner_operator_amount(request.form.get("owner_operator_amount", load["owner_operator_amount"]))
+            load_number = validate_load_number(request.form.get("load_no"),load_id)
+            execute_load_write(
+                """
+                UPDATE loads
+                SET load_no = ?, broker_load_no = ?, load_trailer_no = ?, optional_stop_1 = ?, optional_stop_1_zip = ?, optional_stop_2 = ?, optional_stop_2_zip = ?,
+                    pickup_location_name = ?, pickup_address = ?, origin = ?, origin_zip = ?,
+                    delivery_location_name = ?, delivery_address = ?, destination = ?, destination_zip = ?,
+                    pickup_date = ?, pickup_time = ?, delivery_date = ?, delivery_time = ?, rate = ?, status = ?,
+                    driver_id = ?, truck_id = ?, trailer_id = ?, customer_id = ?, loaded_miles = ?, empty_miles = ?, owner_operator_amount = ?, pickup_number = ?
+                WHERE id = ?
+                """,
+                (
+                    load_number,
+                    request.form.get("broker_load_no"),
+                    request.form.get("load_trailer_no"),
+                    request.form.get("optional_stop_1"),
+                    request.form.get("optional_stop_1_zip"),
+                    request.form.get("optional_stop_2"),
+                    request.form.get("optional_stop_2_zip"),
+                    request.form.get("pickup_location_name"),
+                    request.form.get("pickup_address"),
+                    request.form.get("origin"),
+                    request.form.get("origin_zip"),
+                    request.form.get("delivery_location_name"),
+                    request.form.get("delivery_address"),
+                    request.form.get("destination"),
+                    request.form.get("destination_zip"),
+                    request.form.get("pickup_date") or None,
+                    request.form.get("pickup_time") or None,
+                    request.form.get("delivery_date") or None,
+                    request.form.get("delivery_time") or None,
+                    request.form.get("rate") or 0,
+                    request.form.get("status"),
+                    request.form.get("driver_id") or None,
+                    request.form.get("truck_id") or None,
+                    request.form.get("trailer_id") or None,
+                    request.form.get("customer_id") or None,
+                    loaded_miles, empty_miles, owner_operator_amount, request.form.get("pickup_number", load["pickup_number"] or "").strip(),
+                    load_id,
+                ),
+            )
+            return redirect("/loads")
+
         except ValueError as exc:
-            return page(f"<p>{html_attr(str(exc))}</p><a href='/loads'>Back to Loads</a>"), 400
-        execute(
-            """
-            UPDATE loads
-            SET load_no = ?, broker_load_no = ?, load_trailer_no = ?, optional_stop_1 = ?, optional_stop_1_zip = ?, optional_stop_2 = ?, optional_stop_2_zip = ?,
-                pickup_location_name = ?, pickup_address = ?, origin = ?, origin_zip = ?,
-                delivery_location_name = ?, delivery_address = ?, destination = ?, destination_zip = ?,
-                pickup_date = ?, pickup_time = ?, delivery_date = ?, delivery_time = ?, rate = ?, status = ?,
-                driver_id = ?, truck_id = ?, trailer_id = ?, customer_id = ?, loaded_miles = ?, empty_miles = ?, owner_operator_amount = ?
-            WHERE id = ?
-            """,
-            (
-                request.form.get("load_no"),
-                request.form.get("broker_load_no"),
-                request.form.get("load_trailer_no"),
-                request.form.get("optional_stop_1"),
-                request.form.get("optional_stop_1_zip"),
-                request.form.get("optional_stop_2"),
-                request.form.get("optional_stop_2_zip"),
-                request.form.get("pickup_location_name"),
-                request.form.get("pickup_address"),
-                request.form.get("origin"),
-                request.form.get("origin_zip"),
-                request.form.get("delivery_location_name"),
-                request.form.get("delivery_address"),
-                request.form.get("destination"),
-                request.form.get("destination_zip"),
-                request.form.get("pickup_date") or None,
-                request.form.get("pickup_time") or None,
-                request.form.get("delivery_date") or None,
-                request.form.get("delivery_time") or None,
-                request.form.get("rate") or 0,
-                request.form.get("status"),
-                request.form.get("driver_id") or None,
-                request.form.get("truck_id") or None,
-                request.form.get("trailer_id") or None,
-                request.form.get("customer_id") or None,
-                loaded_miles, empty_miles, owner_operator_amount,
-                load_id,
-            ),
-        )
-        return redirect("/loads")
+            return page(f"<div class='card'><h1>Load not saved</h1><p role='alert'>{html_attr(str(exc))}</p><a href='/loads'>Back to Loads</a></div>"),400
 
     customers = query("SELECT * FROM customers WHERE COALESCE(is_deleted,0)=0 OR id=? ORDER BY name", (load["customer_id"],))
     drivers = query("SELECT * FROM drivers WHERE COALESCE(is_deleted, 0) = 0 OR id = ? ORDER BY name", (load["driver_id"],))
@@ -2024,6 +2007,7 @@ def edit_load(load_id):
         <div class='form-grid'>
           <input name='load_no' placeholder='Load # / Internal Load #' value='{html_attr(load['load_no'])}' required>
           <input name='broker_load_no' placeholder='Broker Load #' value='{html_attr(load['broker_load_no'])}'>
+          <label>PU #<input name='pickup_number' maxlength='150' value='{html_attr(load['pickup_number'])}' placeholder='Pickup number (optional)'></label>
           <select name='customer_id'>{customer_opts}</select>
 
           <input name='pickup_location_name' placeholder='Pickup location name' value='{html_attr(load['pickup_location_name'])}'>
@@ -3318,6 +3302,10 @@ if USE_POSTGRES:
     execute('ALTER TABLE loads ADD COLUMN IF NOT EXISTS owner_operator_amount TEXT')
 elif 'owner_operator_amount' not in {row['name'] for row in query('PRAGMA table_info(loads)')}:
     execute('ALTER TABLE loads ADD COLUMN owner_operator_amount TEXT')
+if USE_POSTGRES:
+    execute('ALTER TABLE loads ADD COLUMN IF NOT EXISTS pickup_number TEXT')
+elif 'pickup_number' not in {row['name'] for row in query('PRAGMA table_info(loads)')}:
+    execute('ALTER TABLE loads ADD COLUMN pickup_number TEXT')
 for table in ("loads", "drivers", "customers"):
     if USE_POSTGRES:
         execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS is_deleted INTEGER DEFAULT 0")
@@ -3329,6 +3317,9 @@ execute("""CREATE TABLE IF NOT EXISTS billing_attachments (
            stored_name TEXT PRIMARY KEY, original_name TEXT NOT NULL,
            invoice_id INTEGER, load_id INTEGER, uploaded_at TEXT NOT NULL,
            data_base64 TEXT NOT NULL)""")
+execute("""CREATE UNIQUE INDEX IF NOT EXISTS unique_active_internal_load_number
+           ON loads(lower(trim(load_no)))
+           WHERE COALESCE(is_deleted,0)=0 AND trim(COALESCE(load_no,''))!='' """)
 from fuel_reports import register_fuel
 fuel_driver_fields, fuel_report_section = register_fuel(
     app, db, query, query_one, execute, normalize_sql, page, html_attr, USE_POSTGRES)
