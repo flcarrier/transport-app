@@ -2,6 +2,7 @@ from flask import Flask, request, redirect, render_template_string, jsonify, sen
 import os
 import sqlite3
 from driver_statement import mileage_input
+from load_confirmation import CONFIRMATION_UI, register_confirmation, read_upload, document_pages
 
 # PostgreSQL driver is imported lazily inside db().
 # This avoids Render startup issues where a top-level import can fail silently.
@@ -1563,9 +1564,30 @@ def validate_load_number(value, exclude_id=0):
     return number
 
 
-def execute_load_write(sql, params):
+def execute_load_write(sql, params, confirmation=None):
     try:
-        execute(sql,params)
+        if confirmation is None:
+            execute(sql,params)
+        else:
+            # Create the load and its original confirmation in one transaction.
+            original_name, data = confirmation
+            with closing(db()) as conn:
+                cur=conn.cursor()
+                try:
+                    cur.execute(normalize_sql(sql),params)
+                    cur.execute(normalize_sql('SELECT id FROM loads WHERE load_no=?'),(params[0],))
+                    row=cur.fetchone()
+                    load_id=row['id']
+                    stored_name=f"{load_id}_{uuid.uuid4().hex}_{secure_filename(original_name)}"
+                    now=datetime.now().isoformat()
+                    cur.execute(normalize_sql("INSERT INTO billing_attachments (stored_name,original_name,load_id,uploaded_at,data_base64) VALUES (?,?,?,?,?)"),
+                        (stored_name,original_name,load_id,now,base64.b64encode(data).decode('ascii')))
+                    cur.execute(normalize_sql("INSERT INTO load_files (load_id,original_name,stored_name,uploaded_at) VALUES (?,?,?,?)"),
+                        (load_id,original_name,stored_name,now))
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
     except Exception as exc:
         if isinstance(exc,sqlite3.IntegrityError) or getattr(exc,'pgcode',None)=='23505' or getattr(exc,'sqlstate',None)=='23505':
             raise ValueError('That internal load number was just used by another load. Refresh and choose a different number.') from exc
@@ -1603,6 +1625,19 @@ def loads():
             empty_miles = mileage_input(request.form.get("empty_miles"))
             owner_operator_amount = parse_owner_operator_amount(request.form.get("owner_operator_amount"))
             load_number = validate_load_number(request.form.get("load_no"))
+            confirmation=None
+            source=request.files.get('confirmation_file')
+            if source and source.filename:
+                if request.form.get('confirmation_reviewed')!='1':
+                    raise ValueError('Review the uploaded confirmation before creating the load.')
+                source_data=read_upload(source)
+                try:
+                    document_pages(source_data)
+                except ValueError:
+                    raise
+                except Exception as exc:
+                    raise ValueError('Could not read the confirmation. Use an unlocked PDF or clear photo.') from exc
+                confirmation=(source.filename,source_data)
             execute_load_write(
                 """
                 INSERT INTO loads (
@@ -1640,6 +1675,7 @@ def loads():
                     request.form.get("customer_id") or None,
                     loaded_miles, empty_miles, owner_operator_amount, request.form.get("pickup_number", "").strip(),
                 ),
+                confirmation=confirmation,
             )
             return redirect("/loads")
 
@@ -1783,7 +1819,8 @@ def loads():
         <h1>Loads</h1>
         {uninvoiced_loads_total()}
         {closed_loads_awaiting_invoices()}
-        <form method='post' id='load-form'>
+        <form method='post' id='load-form' enctype='multipart/form-data'>
+          {CONFIRMATION_UI}
           <div class='form-grid'>
             <label>Internal Load # (editable)<input name='load_no' placeholder='Load # / Internal Load #' value='{html_attr(next_internal_load_number())}' required></label>
             <input name='broker_load_no' placeholder='Broker Load #'>
@@ -3320,6 +3357,7 @@ execute("""CREATE TABLE IF NOT EXISTS billing_attachments (
 execute("""CREATE UNIQUE INDEX IF NOT EXISTS unique_active_internal_load_number
            ON loads(lower(trim(load_no)))
            WHERE COALESCE(is_deleted,0)=0 AND trim(COALESCE(load_no,''))!='' """)
+register_confirmation(app, query)
 from fuel_reports import register_fuel
 fuel_driver_fields, fuel_report_section = register_fuel(
     app, db, query, query_one, execute, normalize_sql, page, html_attr, USE_POSTGRES)
