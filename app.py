@@ -1350,7 +1350,7 @@ def drivers():
         <form method='post'>
           <input name='name' placeholder='Driver name' required>
           <label>Driver pay per mile ($)<input name='pay_rate_per_mile' type='number' min='0' step='0.0001' placeholder='Optional: enter agreed pay rate'></label>
-          <label>Fuel card — last 4 or 5 digits<input name='fuel_card' inputmode='numeric' pattern='[0-9]{{4,5}}' maxlength='5' placeholder='Optional: 01531'></label>
+          <label>Fuel card â€” last 4 or 5 digits<input name='fuel_card' inputmode='numeric' pattern='[0-9]{{4,5}}' maxlength='5' placeholder='Optional: 01531'></label>
           <button>Add</button>
         </form>
       </div>
@@ -2892,9 +2892,9 @@ def driver_report():
     start = request.args.get("start", "")
     end = request.args.get("end", "")
 
-    drivers = query("SELECT * FROM drivers ORDER BY name")
+    drivers = query("SELECT * FROM drivers WHERE COALESCE(is_deleted,0)=0 OR id=? ORDER BY name,id", (int(driver_id) if driver_id.isdigit() else -1,))
     opts = "<option value=''>Select driver</option>" + "".join(
-        f"<option value='{d['id']}' {selected(d['id'], driver_id)}>{d['name']}</option>" for d in drivers
+        f"<option value='{d['id']}' {selected(d['id'], driver_id)}>{html_attr(d['name'])}{' — Deleted profile (historical)' if d['is_deleted'] else ''}</option>" for d in drivers
     )
 
     rows = "<tr><td colspan='13'>Select a driver and run the report.</td></tr>"

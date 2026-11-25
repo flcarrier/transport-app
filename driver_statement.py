@@ -110,7 +110,7 @@ def register_statements(app, query, query_one, execute, page, esc, postgres, tri
           <h3>Credits and deductions (optional)</h3>
           <label>Description<input name='adjustment_description' placeholder='Example: Expense reimbursement'></label>
           <label>Amount ($)<input type='number' min='0' step='0.01' name='adjustment_amount'></label>
-          <label>Type<select name='adjustment_type'><option value='credit'>Credit — add to check</option><option value='deduction'>Deduction — subtract from check</option></select></label>
+          <label>Type<select name='adjustment_type'><option value='credit'>Credit â€” add to check</option><option value='deduction'>Deduction â€” subtract from check</option></select></label>
           </details>"""
 
     def report_context():
@@ -301,6 +301,9 @@ def render_statement(info, trips, adjustments):
                  ['Driver check amount',money(result['check'])],
                  ['Fuel gallons (purchased)',f"{company['gallons']:,.3f}"],
                  ['Total fuel cost',money(company['fuel_cost'])],
+                 ['Fuel gallons in selected dates',f"{company['within_gallons']:,.3f}"],
+                 ['Fuel cost in selected dates',money(company['within_cost'])],
+                 ['Earlier unreported fuel cost',money(company['earlier_cost'])],
                  ['Total costs (driver check + fuel)',money(company['total_costs'])],
                  ['Company balance after costs',money(company['balance'])]]
         story += [grid([[p(label),p(value)] for label,value in summary],[382,170],header=False),Spacer(1,8),
@@ -313,6 +316,7 @@ def render_statement(info, trips, adjustments):
             confirmations.append([p(row['date'],'small'),p(row['load_no'],'small'),p(money(row['amount']),'small')])
         confirmations.append([p('Total','small'),'',p(money(company['confirmation_total']),'small')])
         story += [grid(confirmations,[80,352,120]),Spacer(1,12),p('Fuel Purchases','header'),
+                  p(f"Approved scanned receipts in selected dates: {company['receipt_count']} / {company['receipt_gallons']:,.3f} gallons / {money(company['receipt_cost'])}.",'small'),
                   p('Gallons and costs are purchases from saved receipts/imports. Within-date purchases are shown even when already reported; older purchases appear only when no prior fuel report covers them.','small')]
         purchases=[[p(label,'small') for label in ['Purchase date','Transaction','Station / location','Gallons','Fuel cost','Coverage']]]
         for row in company['fuel']:
